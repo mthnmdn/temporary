@@ -75,16 +75,19 @@
         quiet: true
       run_once: true
 
-    - name: Ensure there are no duplicate ansible_host (IP) entries in the inventory
-      vars:
-        host_ips: "{{ groups['all'] | map('extract', hostvars, 'ansible_host') | select('defined') | list }}"
+    - name: Ensure master/infra/worker groups do not share any host
+      # A host must belong to only one role group. Hub is intentionally excluded.
       ansible.builtin.assert:
         that:
-          - host_ips | length == host_ips | unique | length
+          - groups['master'] | default([]) | intersect(groups['infra'] | default([])) | length == 0
+          - groups['master'] | default([]) | intersect(groups['worker'] | default([])) | length == 0
+          - groups['infra'] | default([]) | intersect(groups['worker'] | default([])) | length == 0
         fail_msg: >-
-          Duplicate ansible_host/IP detected in the inventory.
-          Values: {{ host_ips | sort }}
-        success_msg: "No duplicate ansible_host/IP entries"
+          A host appears in more than one role group →
+          master∩infra={{ groups['master'] | default([]) | intersect(groups['infra'] | default([])) }},
+          master∩worker={{ groups['master'] | default([]) | intersect(groups['worker'] | default([])) }},
+          infra∩worker={{ groups['infra'] | default([]) | intersect(groups['worker'] | default([])) }}
+        success_msg: "No host overlap across master/infra/worker groups"
         quiet: true
       run_once: true
 
