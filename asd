@@ -43,16 +43,9 @@
     # api_address must look like: api.<cluster_name>.<something>.com:6443
     api_address_regex: "^api\\.{{ cluster_name | regex_escape }}\\.[a-zA-Z0-9-]+\\.com:6443$"
 
-    # Expected pfx file name (pulled from the repo)
+    # Expected pfx file name and its local path (under the playbook's files/ dir)
     expected_pfx_name: "ingress-{{ cluster_name }}.pfx"
-
-    # --- pfx repository settings (override these for your repo) ---
-    # Base URL where the pfx file lives, e.g. https://nexus.example.com/repo/certs
-    pfx_repo_base_url: "https://REPLACE_ME/certs"
-    pfx_repo_validate_certs: true
-    # Optional auth (leave undefined if the repo is anonymous)
-    # pfx_repo_username: "user"
-    # pfx_repo_password: "pass"
+    expected_pfx_path: "{{ playbook_dir }}/files/{{ expected_pfx_name }}"
 
   tasks:
 
@@ -163,16 +156,20 @@
         quiet: true
       run_once: true
 
-    - name: Ensure pfx file exists in the repository
-      ansible.builtin.uri:
-        url: "{{ pfx_repo_base_url }}/{{ expected_pfx_name }}"
-        method: HEAD
-        status_code: 200
-        validate_certs: "{{ pfx_repo_validate_certs }}"
-        url_username: "{{ pfx_repo_username | default(omit) }}"
-        url_password: "{{ pfx_repo_password | default(omit) }}"
-        force_basic_auth: "{{ pfx_repo_username is defined }}"
+    - name: Check that the pfx file exists on the local filesystem
+      ansible.builtin.stat:
+        path: "{{ expected_pfx_path }}"
       delegate_to: localhost
+      run_once: true
+      register: pfx_file
+
+    - name: Ensure the pfx file is present under files/
+      ansible.builtin.assert:
+        that:
+          - pfx_file.stat.exists
+        fail_msg: "pfx file not found at '{{ expected_pfx_path }}'"
+        success_msg: "pfx file found at '{{ expected_pfx_path }}'"
+        quiet: true
       run_once: true
 
     # ------------------------------------------------------------------
