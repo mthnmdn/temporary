@@ -1,71 +1,16 @@
----
-# Reboot playbook - installation use only.
-#
-# SAFETY: Only the master, infra and worker groups are ever rebooted.
-# Each group is handled by a separate play that targets that group explicitly,
-# so no other host (e.g. the hub group) can ever be affected by this playbook.
-#
-# Concurrency per group is controlled by variables, expressed as a percentage:
-#   master_reboot_batch, infra_reboot_batch, worker_reboot_batch   (e.g. "25%")
-# Set a batch to "1" to reboot one server at a time. Either way, the reboot
-# module always waits for each host to come back before moving on.
-#
-# Reboot timeouts differ for physical vs virtual servers and are chosen
-# automatically per host based on the gathered virtualization facts.
+[master]
 
-- name: Reboot master nodes
-  hosts: master
-  gather_facts: true
-  serial: "{{ master_reboot_batch | default('25%') }}"
-  any_errors_fatal: true
-  vars: &reboot_vars
-    # Reboot timeouts (seconds) - separate values for physical and virtual hosts
-    reboot_timeout_physical: 1800
-    reboot_timeout_virtual: 600
-    reboot_connect_timeout: 60
-    reboot_pre_delay: 0
-    reboot_post_delay: 15
-  tasks: &reboot_tasks
-    - name: Capture boot id before reboot
-      ansible.builtin.slurp:
-        src: /proc/sys/kernel/random/boot_id
-      register: boot_id_before
+master01
 
-    - name: Reboot the node and wait for it to come back
-      ansible.builtin.reboot:
-        # Physical servers get the longer timeout (POST/firmware takes longer);
-        # only true VMs report virtualization_role == 'guest'.
-        reboot_timeout: "{{ (reboot_timeout_virtual if ansible_virtualization_role == 'guest' else reboot_timeout_physical) | int }}"
-        connect_timeout: "{{ reboot_connect_timeout | int }}"
-        pre_reboot_delay: "{{ reboot_pre_delay | int }}"
-        post_reboot_delay: "{{ reboot_post_delay | int }}"
-        msg: "Reboot triggered by Ansible (installation)"
+[physical-workers]
 
-    - name: Capture boot id after reboot
-      ansible.builtin.slurp:
-        src: /proc/sys/kernel/random/boot_id
-      register: boot_id_after
+worker01
 
-    - name: Verify the node actually rebooted (boot id must change)
-      ansible.builtin.assert:
-        that:
-          - boot_id_before.content != boot_id_after.content
-        fail_msg: "{{ inventory_hostname }}: boot id unchanged — the node did NOT reboot"
-        success_msg: "{{ inventory_hostname }}: reboot verified (boot id changed)"
-        quiet: true
+[virtual-workers]
 
-- name: Reboot infra nodes
-  hosts: infra
-  gather_facts: true
-  serial: "{{ infra_reboot_batch | default('25%') }}"
-  any_errors_fatal: true
-  vars: *reboot_vars
-  tasks: *reboot_tasks
+worker02
 
-- name: Reboot worker nodes
-  hosts: worker
-  gather_facts: true
-  serial: "{{ worker_reboot_batch | default('25%') }}"
-  any_errors_fatal: true
-  vars: *reboot_vars
-  tasks: *reboot_tasks
+[workers:children]
+
+physical-workers
+virtual-workers
