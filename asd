@@ -10,11 +10,9 @@
       changed_when: false
       #when: false
 
-    - name: "Add K8S Token and Hash to Dummy Host"
-      ansible.builtin.add_host:
-        name:   "K8S_TOKEN_HOLDER"
+    - name: Store join command as a fact on master
+      ansible.builtin.set_fact:
         join_command: "{{ join_command_output.stdout }}"
-      changed_when: false
       #when: false
 
 - name: Add new worker
@@ -22,6 +20,10 @@
   no_log: "{{ hide_logs | default(true) | bool }}"
   become: true
   gather_facts: false
+  vars:
+    # Gruba göre kubelet config kaynakları (sabit değerler, değişkene bağlı)
+    physical_kubelet_config_source: "./physical-worker-kubelet-config.yaml"
+    virtual_kubelet_config_source: "./virtual-worker-kubelet-config.yaml"
   tasks:
 
     - name: Copy kubernetes.sh to workers
@@ -40,17 +42,17 @@
       #when: false
 
     - name: Add new worker
+      # Join komutu master host'unun fact'inden okunuyor.
       ansible.builtin.command: |
-        {{ hostvars['K8S_TOKEN_HOLDER']['join_command'] }} --node-name {{ inventory_hostname }}
+        {{ hostvars[groups['master'][0]]['join_command'] }} --node-name {{ inventory_hostname }}
       args:
         creates: /etc/kubernetes/kubelet.conf
       #when: false
 
     - name: Set kubelet conf
-      # Her host, ait olduğu alt grubun (physical/virtual) kubelet_config_source
-      # değerini otomatik alır. Tanımlı değilse default_kubelet_config_source kullanılır.
+      # Host physical-workers grubundaysa physical config, değilse virtual config kullanılır.
       ansible.builtin.copy:
-        src: "{{ kubelet_config_source }}"
+        src: "{{ physical_kubelet_config_source if inventory_hostname in (groups['physical-workers'] | default([])) else virtual_kubelet_config_source }}"
         dest: /var/lib/kubelet/config.yaml
         owner: root
         group: root
@@ -72,18 +74,25 @@
   gather_facts: false
   vars:
     kubeconfig: "/etc/kubernetes/admin.conf"
-    # Her worker'da ortak olan label(lar)
-    common_worker_labels: "node.kubernetes.io/exclude-from-external-load-balancers="
+    # Sabit label'lar, değişkene bağlı
+    physical_worker_labels: "node.kubernetes.io/exclude-from-external-load-balancers= node-role.kubernetes.io/physical-worker="
+    virtual_worker_labels: "node.kubernetes.io/exclude-from-external-load-balancers= node-role.kubernetes.io/virtual-worker="
     default_worker_taints: "new-node=true:NoSchedule"
   tasks:
 
-    - name: Add label to worker
+    - name: Label physical workers
       #when: false
-      # worker'ın rol label'ı (physical/virtual) hostvars üzerinden alınır,
-      # ortak label ile birleştirilerek uygulanır.
       ansible.builtin.command: |
-        kubectl label no {{ worker }} {{ common_worker_labels }} {{ hostvars[worker]['worker_role_label'] }} --kubeconfig {{ kubeconfig }}
-      loop: "{{ groups['workers'] | default([]) }}"
+        kubectl label no {{ worker }} {{ physical_worker_labels }} --kubeconfig {{ kubeconfig }}
+      loop: "{{ groups['physical-workers'] | default([]) }}"
+      loop_control:
+        loop_var: worker
+
+    - name: Label virtual workers
+      #when: false
+      ansible.builtin.command: |
+        kubectl label no {{ worker }} {{ virtual_worker_labels }} --kubeconfig {{ kubeconfig }}
+      loop: "{{ groups['virtual-workers'] | default([]) }}"
       loop_control:
         loop_var: worker
 
