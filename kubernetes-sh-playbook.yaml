@@ -191,31 +191,31 @@
               {% endfor %}
               search {{ dns_search_domain }}
 
-        - name: Kernel modüllerini boot'ta yüklenecek şekilde tanımla
-          ansible.builtin.copy:
-            dest: /etc/modules-load.d/k8s.conf
-            mode: "0644"
-            content: |
-              {% for module in kernel_modules %}
-              {{ module }}
-              {% endfor %}
-
-        - name: Kernel modüllerini şimdi yükle
-          community.general.modprobe:
-            name: "{{ item }}"
-            state: present
-          loop: "{{ kernel_modules }}"
-
-        # Modüller yüklendikten sonra uygulanmalı (fq/bbr modüle bağımlı)
-        - name: Sysctl ayarlarını uygula
-          ansible.posix.sysctl:
-            name: "{{ item.key }}"
-            value: "{{ item.value }}"
-            sysctl_file: /etc/sysctl.d/99-kubernetes.conf
-            reload: true
-          loop: "{{ sysctl_settings | dict2items }}"
-          loop_control:
-            label: "{{ item.key }}"
+#        - name: Kernel modüllerini boot'ta yüklenecek şekilde tanımla
+#          ansible.builtin.copy:
+#            dest: /etc/modules-load.d/k8s.conf
+#            mode: "0644"
+#            content: |
+#              {% for module in kernel_modules %}
+#              {{ module }}
+#              {% endfor %}
+#
+#        - name: Kernel modüllerini şimdi yükle # BU TASK'I TEK ÇALIŞTIRIP community.general.modprobe modülünün olup olmadığını kontrol et.
+#          community.general.modprobe:
+#            name: "{{ item }}"
+#            state: present
+#          loop: "{{ kernel_modules }}"
+#
+#        # Modüller yüklendikten sonra uygulanmalı (fq/bbr modüle bağımlı) # BU TASK'I TEK ÇALIŞTIRIP ansible.posix.sysctl modülünün olup olmadığını kontrol et.
+#        - name: Sysctl ayarlarını uygula
+#          ansible.posix.sysctl:
+#            name: "{{ item.key }}"
+#            value: "{{ item.value }}"
+#            sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+#            reload: true
+#          loop: "{{ sysctl_settings | dict2items }}"
+#          loop_control:
+#            label: "{{ item.key }}"
 
         # Script limits.conf'a append ediyordu (her çalıştırmada tekrar);
         # bunun yerine limits.d altına idempotent tek dosya yazıyoruz.
@@ -240,9 +240,9 @@
             regexp: '^(/dev/mapper/rootvg-swaplv\s.*)$'
             replace: '#\1'
 
-        - name: SELinux'u devre dışı bırak
-          ansible.posix.selinux:
-            state: disabled
+#        - name: SELinux'u devre dışı bırak # BU TASK'I TEK ÇALIŞTIRIP ansible.posix.selinux modülünün olup olmadığını kontrol et.
+#          ansible.posix.selinux:
+#            state: disabled
 
     # =========================================================================
     # 3. CONTAINERD KURULUMU
@@ -541,4 +541,5 @@
       ansible.builtin.systemd_service:
         name: containerd
         state: restarted
+        enabled: true
         daemon_reload: true
