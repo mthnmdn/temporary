@@ -1,0 +1,544 @@
+---
+# =============================================================================
+# Kubernetes Node Hazırlık Playbook'u
+# kubernetes-raw.sh script'inin Ansible çevirisi.
+#
+# Hedef: RHEL tabanlı, kapalı ağ (air-gapped/proxy) ortamında bir sunucuyu
+# Kubernetes node'u olarak hazırlar. kubeadm init/join ÇALIŞTIRMAZ.
+#
+# Gereksinimler:
+#   - ansible.posix koleksiyonu (ansible-galaxy collection install ansible.posix)
+#   - Hedef sunucularda var-lib-containerd.mount ve var-lib-kubelet.mount
+#     systemd mount unit'leri tanımlı olmalı (servis unit'leri bunları istiyor)
+#
+# Çalıştırma: ansible-playbook -i envanter kubernetes-node-setup.yml
+# =============================================================================
+
+- name: Kubernetes node hazırlığı
+  hosts: k8s_nodes
+  become: true
+
+  # ---------------------------------------------------------------------------
+  # DEĞİŞKENLER — ortama göre burayı düzenle
+  # ---------------------------------------------------------------------------
+  vars:
+    setup_dir: /tmp/setup
+
+    # -- DEĞİŞTİR: paket deposu ve proxy bilgileri --
+    k8s_package_url: "https://asd.com/k8s/k8s-1_35_5-package.tar.gz"
+    proxy_http: "http://xxx.yyy.com:8080"
+    proxy_no_proxy: "xxx.yyy.zzz.dddd"
+
+    # -- DEĞİŞTİR: NTP ve DNS --
+    ntp_server: "x.x.x.x"
+    dns_servers:
+      - "x.x.x.x"
+      - "x.x.x.x"
+    dns_search_domain: "asd.dsa"
+
+    # -- DEĞİŞTİR: iç CA sertifika zinciri --
+    ca_certificate: |
+      -----BEGIN CERTIFICATE-----
+      ...
+      -----END CERTIFICATE-----
+      -----BEGIN CERTIFICATE-----
+      ...
+      -----END CERTIFICATE-----
+      -----BEGIN CERTIFICATE-----
+      ...
+      -----END CERTIFICATE-----
+
+    # İç registry mirror'ı ve mirror'lanacak registry'ler
+    registry_mirror: "https://ocp.artifact.preprod.com"
+    mirrored_registries:
+      - docker.io
+      - registry.k8s.io
+      - quay.io
+      - ghcr.io
+      - nvcr.io
+      - public.ecr.aws
+      - ecr-public.aws.com
+      - reg.kyverno.io
+
+    os_packages:
+      - bash-completion
+      - elfutils-libelf-devel
+      - bpftool
+      - iptables
+      - iproute
+      - socat
+      - clang
+      - llvm
+      - conntrack
+      - git
+
+    kernel_modules:
+      - tcp_bbr
+      - sch_fq
+      - xt_set
+      - ip_set
+      - xt_mark
+      - xt_socket
+      - xt_connmark
+      - br_netfilter
+      - overlay
+      - dm_crypt
+
+    # Script /etc/sysctl.conf'u eziyordu; best practice olarak
+    # /etc/sysctl.d/99-kubernetes.conf altına yazıyoruz.
+    sysctl_settings:
+      # Kubernetes
+      net.ipv4.ip_forward: 1
+      vm.max_map_count: 8252565
+      fs.file-max: 8252565
+      fs.inotify.max_user_instances: 8252565
+      fs.inotify.max_user_watches: 8252565
+      net.core.default_qdisc: fq
+      net.ipv4.tcp_congestion_control: bbr
+      net.core.rmem_max: 16777216
+      net.core.wmem_max: 16777216
+      net.ipv4.tcp_rmem: "4096 131072 16777216"
+      net.ipv4.tcp_wmem: "4096 131072 16777216"
+      # Genel sistem / güvenlik sıkılaştırma
+      net.ipv6.conf.all.disable_ipv6: 1
+      net.ipv6.conf.default.disable_ipv6: 1
+      net.ipv6.conf.lo.disable_ipv6: 0
+      vm.swappiness: 10
+      net.ipv4.conf.default.rp_filter: 1
+      net.ipv4.conf.all.rp_filter: 1
+      net.ipv4.route.flush: 1
+      net.ipv4.conf.all.accept_source_route: 0
+      net.ipv4.conf.default.accept_source_route: 0
+      net.ipv6.conf.all.accept_source_route: 0
+      net.ipv6.conf.default.accept_source_route: 0
+      net.ipv4.icmp_echo_ignore_broadcasts: 1
+      net.ipv4.icmp_ignore_bogus_error_responses: 1
+      net.ipv6.conf.all.forwarding: 0
+      net.ipv4.tcp_syncookies: 1
+
+    # /usr/local/bin altına kurulan ve bash completion üretilecek araçlar
+    cli_tools:
+      - kubectl
+      - kubeadm
+      - crictl
+      - cilium
+      - helm
+      - clusteradm
+
+  tasks:
+    # =========================================================================
+    # 1. CA SERTİFİKASI VE PAKET İNDİRME
+    # =========================================================================
+    - name: 1 | CA sertifikası ve paket indirme
+      block:
+        - name: İç CA sertifikasını güvenilir depoya ekle
+          ansible.builtin.copy:
+            content: "{{ ca_certificate }}"
+            dest: /etc/pki/ca-trust/source/anchors/artifacthub.crt
+            mode: "0644"
+          notify: CA güven deposunu güncelle
+
+        - name: Kurulum dizinini oluştur
+          ansible.builtin.file:
+            path: "{{ setup_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: K8s paketini indir
+          ansible.builtin.get_url:
+            url: "{{ k8s_package_url }}"
+            dest: "{{ setup_dir }}/k8s-package.tar.gz"
+            validate_certs: false   # script'teki --no-check-certificate karşılığı
+            mode: "0644"
+
+        - name: K8s paketini aç
+          ansible.builtin.unarchive:
+            src: "{{ setup_dir }}/k8s-package.tar.gz"
+            dest: "{{ setup_dir }}"
+            remote_src: true
+
+    # =========================================================================
+    # 2. İŞLETİM SİSTEMİ HAZIRLIĞI
+    # =========================================================================
+    - name: 2 | İşletim sistemi hazırlığı
+      block:
+        - name: Gerekli OS paketlerini kur
+          ansible.builtin.dnf:
+            name: "{{ os_packages }}"
+            state: present
+
+        - name: Chrony yapılandırması
+          ansible.builtin.copy:
+            dest: /etc/chrony.conf
+            mode: "0644"
+            content: |
+              server {{ ntp_server }} iburst
+              driftfile /var/lib/chrony/drift
+              makestep 1 -1
+              rtcsync
+              logdir /var/log/chrony
+              maxupdateskew 100.0
+          notify: Chronyd'yi yeniden başlat
+
+        # Not: NetworkManager resolv.conf'u yönetiyorsa bu dosyayı ezebilir.
+        - name: DNS yapılandırması (resolv.conf)
+          ansible.builtin.copy:
+            dest: /etc/resolv.conf
+            mode: "0644"
+            content: |
+              {% for ns in dns_servers %}
+              nameserver {{ ns }}
+              {% endfor %}
+              search {{ dns_search_domain }}
+
+        - name: Kernel modüllerini boot'ta yüklenecek şekilde tanımla
+          ansible.builtin.copy:
+            dest: /etc/modules-load.d/k8s.conf
+            mode: "0644"
+            content: |
+              {% for module in kernel_modules %}
+              {{ module }}
+              {% endfor %}
+
+        - name: Kernel modüllerini şimdi yükle
+          community.general.modprobe:
+            name: "{{ item }}"
+            state: present
+          loop: "{{ kernel_modules }}"
+
+        # Modüller yüklendikten sonra uygulanmalı (fq/bbr modüle bağımlı)
+        - name: Sysctl ayarlarını uygula
+          ansible.posix.sysctl:
+            name: "{{ item.key }}"
+            value: "{{ item.value }}"
+            sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+            reload: true
+          loop: "{{ sysctl_settings | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+        # Script limits.conf'a append ediyordu (her çalıştırmada tekrar);
+        # bunun yerine limits.d altına idempotent tek dosya yazıyoruz.
+        - name: Kaynak limitlerini ayarla
+          ansible.builtin.copy:
+            dest: /etc/security/limits.d/99-kubernetes.conf
+            mode: "0644"
+            content: |
+              * soft nofile unlimited
+              * hard nofile unlimited
+              * soft memlock unlimited
+              * hard memlock unlimited
+
+        - name: Swap'i kapat
+          ansible.builtin.command: swapoff -a
+          when: ansible_swaptotal_mb > 0
+          changed_when: true
+
+        - name: Swap satırını fstab'da yorum satırı yap
+          ansible.builtin.replace:
+            path: /etc/fstab
+            regexp: '^(/dev/mapper/rootvg-swaplv\s.*)$'
+            replace: '#\1'
+
+        - name: SELinux'u devre dışı bırak
+          ansible.posix.selinux:
+            state: disabled
+
+    # =========================================================================
+    # 3. CONTAINERD KURULUMU
+    # =========================================================================
+    - name: 3 | containerd kurulumu
+      block:
+        - name: containerd binary'lerini /usr/local altına aç
+          ansible.builtin.unarchive:
+            src: "{{ setup_dir }}/containerd.tar.gz"
+            dest: /usr/local
+            remote_src: true
+
+        - name: runc binary'sini kur
+          ansible.builtin.copy:
+            src: "{{ setup_dir }}/runc.amd64"
+            dest: /usr/local/sbin/runc
+            mode: "0755"
+            remote_src: true
+
+        - name: CNI plugin dizinini oluştur
+          ansible.builtin.file:
+            path: /opt/cni/bin
+            state: directory
+            mode: "0755"
+
+        - name: CNI plugin'lerini aç
+          ansible.builtin.unarchive:
+            src: "{{ setup_dir }}/cni-plugins.tgz"
+            dest: /opt/cni/bin
+            remote_src: true
+
+        - name: containerd systemd unit dosyası
+          ansible.builtin.copy:
+            dest: /usr/lib/systemd/system/containerd.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=containerd container runtime
+              Documentation=https://containerd.io
+              Wants=network-online.target var-lib-containerd.mount var-lib-kubelet.mount
+              After=network.target local-fs.target dbus.service var-lib-containerd.mount var-lib-kubelet.mount
+              Requires=var-lib-containerd.mount var-lib-kubelet.mount
+
+              [Service]
+              ExecStartPre=-/sbin/modprobe overlay
+              ExecStart=/usr/local/bin/containerd
+
+              Type=notify
+              Delegate=yes
+              KillMode=process
+              Restart=always
+              RestartSec=5
+
+              LimitNPROC=infinity
+              LimitCORE=infinity
+              LimitNOFILE=infinity
+              TasksMax=infinity
+              OOMScoreAdjust=-999
+
+              [Install]
+              WantedBy=multi-user.target
+          notify: containerd'yi yeniden başlat
+
+        - name: containerd drop-in dizinini oluştur
+          ansible.builtin.file:
+            path: /usr/lib/systemd/system/containerd.service.d
+            state: directory
+            mode: "0755"
+
+        - name: containerd proxy yapılandırması
+          ansible.builtin.copy:
+            dest: /usr/lib/systemd/system/containerd.service.d/http-proxy.conf
+            mode: "0644"
+            content: |
+              [Service]
+              Environment="HTTP_PROXY={{ proxy_http }}"
+              Environment="HTTPS_PROXY={{ proxy_http }}"
+              Environment="NO_PROXY={{ proxy_no_proxy }}"
+          notify: containerd'yi yeniden başlat
+
+        - name: containerd config dizinini oluştur
+          ansible.builtin.file:
+            path: /etc/containerd
+            state: directory
+            mode: "0755"
+
+        - name: Varsayılan containerd yapılandırmasını üret
+          ansible.builtin.shell: /usr/local/bin/containerd config default > /etc/containerd/config.toml
+          args:
+            creates: /etc/containerd/config.toml
+
+        - name: config.toml - registry certs.d yolunu ayarla
+          ansible.builtin.replace:
+            path: /etc/containerd/config.toml
+            regexp: "config_path = ''"
+            replace: "config_path = '/etc/containerd/certs.d'"
+          notify: containerd'yi yeniden başlat
+
+        - name: config.toml - SystemdCgroup'u etkinleştir
+          ansible.builtin.replace:
+            path: /etc/containerd/config.toml
+            regexp: "SystemdCgroup = false"
+            replace: "SystemdCgroup = true"
+          notify: containerd'yi yeniden başlat
+
+    # =========================================================================
+    # 4. REGISTRY MIRROR YAPILANDIRMASI
+    # =========================================================================
+    - name: 4 | Registry mirror yapılandırması
+      block:
+        - name: Varsayılan _default registry yapılandırmasını kaldır
+          ansible.builtin.file:
+            path: /etc/containerd/certs.d/_default
+            state: absent
+
+        - name: Registry dizinlerini oluştur
+          ansible.builtin.file:
+            path: "/etc/containerd/certs.d/{{ item }}"
+            state: directory
+            mode: "0755"
+          loop: "{{ mirrored_registries }}"
+
+        # Script'teki 8 ayrı heredoc yerine tek şablon + loop
+        - name: Her registry için hosts.toml oluştur
+          ansible.builtin.copy:
+            dest: "/etc/containerd/certs.d/{{ item }}/hosts.toml"
+            mode: "0644"
+            content: |
+              server = "https://{{ item }}"
+
+              [host."{{ registry_mirror }}"]
+                capabilities = ["pull", "resolve"]
+          loop: "{{ mirrored_registries }}"
+          notify: containerd'yi yeniden başlat
+
+        # Yapılandırma tamamlandıktan SONRA başlatıyoruz;
+        # script'teki 3 kez restart ihtiyacı böylece ortadan kalkıyor.
+        - name: containerd servisini etkinleştir ve başlat
+          ansible.builtin.systemd_service:
+            name: containerd
+            state: started
+            enabled: true
+            daemon_reload: true
+
+    # =========================================================================
+    # 5. KUBERNETES BİLEŞENLERİ
+    # =========================================================================
+    - name: 5 | Kubernetes bileşenleri
+      block:
+        - name: kubeadm, kubelet ve kubectl binary'lerini kur
+          ansible.builtin.copy:
+            src: "{{ setup_dir }}/{{ item }}"
+            dest: "/usr/local/bin/{{ item }}"
+            mode: "0755"
+            remote_src: true
+          loop:
+            - kubeadm
+            - kubelet
+            - kubectl
+
+        - name: crictl'i aç
+          ansible.builtin.unarchive:
+            src: "{{ setup_dir }}/crictl.tar.gz"
+            dest: /usr/local/bin
+            remote_src: true
+
+        - name: crictl yapılandırması
+          ansible.builtin.copy:
+            dest: /etc/crictl.yaml
+            mode: "0644"
+            content: |
+              runtime-endpoint: unix:///run/containerd/containerd.sock
+
+        - name: kubelet systemd unit dosyası
+          ansible.builtin.copy:
+            dest: /usr/lib/systemd/system/kubelet.service
+            mode: "0644"
+            content: |
+              [Unit]
+              Description=kubelet: The Kubernetes Node Agent
+              Documentation=https://kubernetes.io/docs/
+              Wants=network-online.target var-lib-containerd.mount var-lib-kubelet.mount
+              After=network-online.target var-lib-containerd.mount var-lib-kubelet.mount
+              Requires=var-lib-containerd.mount var-lib-kubelet.mount
+
+              [Service]
+              ExecStart=/usr/local/bin/kubelet
+              Restart=always
+              StartLimitInterval=0
+              RestartSec=10
+
+              [Install]
+              WantedBy=multi-user.target
+
+        - name: kubelet drop-in dizinini oluştur
+          ansible.builtin.file:
+            path: /usr/lib/systemd/system/kubelet.service.d
+            state: directory
+            mode: "0755"
+
+        - name: kubelet kubeadm drop-in yapılandırması
+          ansible.builtin.copy:
+            dest: /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf
+            mode: "0644"
+            content: |
+              # Note: This dropin only works with kubeadm and kubelet v1.11+
+              [Service]
+              Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+              Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+              # This is a file that "kubeadm init" and "kubeadm join" generates at runtime, populating the KUBELET_KUBEADM_ARGS variable dynamically
+              EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+              # This is a file that the user can use for overrides of the kubelet args as a last resort.
+              EnvironmentFile=-/etc/sysconfig/kubelet
+              ExecStart=
+              ExecStart=/usr/local/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+
+        - name: /etc/kubernetes/manifests dizinini oluştur
+          ansible.builtin.file:
+            path: /etc/kubernetes/manifests
+            state: directory
+            mode: "0755"
+
+        # Not: kubeadm init/join yapılana kadar kubelet'in restart döngüsünde
+        # olması normaldir (script'te de aynı durum vardı).
+        - name: kubelet servisini etkinleştir ve başlat
+          ansible.builtin.systemd_service:
+            name: kubelet
+            state: started
+            enabled: true
+            daemon_reload: true
+
+    # =========================================================================
+    # 6. EK ARAÇLAR VE BASH COMPLETION
+    # =========================================================================
+    - name: 6 | Ek araçlar ve bash completion
+      block:
+        - name: cilium ve clusteradm arşivlerini aç
+          ansible.builtin.unarchive:
+            src: "{{ setup_dir }}/{{ item }}.tar.gz"
+            dest: "{{ setup_dir }}"
+            remote_src: true
+          loop:
+            - cilium
+            - clusteradm
+
+        - name: helm arşivini aç
+          ansible.builtin.unarchive:
+            src: "{{ setup_dir }}/helm.tar.gz"
+            dest: "{{ setup_dir }}"
+            remote_src: true
+
+        - name: cilium ve clusteradm binary'lerini kur
+          ansible.builtin.copy:
+            src: "{{ setup_dir }}/{{ item }}"
+            dest: "/usr/local/bin/{{ item }}"
+            mode: "0755"
+            remote_src: true
+          loop:
+            - cilium
+            - clusteradm
+
+        - name: helm binary'sini kur
+          ansible.builtin.copy:
+            src: "{{ setup_dir }}/linux-amd64/helm"
+            dest: /usr/local/bin/helm
+            mode: "0755"
+            remote_src: true
+
+        # Script'teki 6 ayrı komut yerine tek loop
+        - name: Bash completion dosyalarını üret
+          ansible.builtin.shell: "/usr/local/bin/{{ item }} completion bash > /etc/bash_completion.d/{{ item }}"
+          args:
+            creates: "/etc/bash_completion.d/{{ item }}"
+          loop: "{{ cli_tools }}"
+
+        - name: Completion dosyalarını herkes için okunabilir yap
+          ansible.builtin.file:
+            path: "/etc/bash_completion.d/{{ item }}"
+            mode: "0644"
+          loop: "{{ cli_tools }}"
+
+  # ---------------------------------------------------------------------------
+  # HANDLER'LAR — sadece ilgili yapılandırma değiştiğinde çalışır
+  # ---------------------------------------------------------------------------
+  handlers:
+    - name: CA güven deposunu güncelle
+      ansible.builtin.command: update-ca-trust extract
+      changed_when: true
+
+    - name: Chronyd'yi yeniden başlat
+      ansible.builtin.systemd_service:
+        name: chronyd
+        state: restarted
+
+    - name: containerd'yi yeniden başlat
+      ansible.builtin.systemd_service:
+        name: containerd
+        state: restarted
+        daemon_reload: true
