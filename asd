@@ -1,30 +1,16 @@
-vars:
-    # ... mevcut required_free_ports ...
-    # Minimum worker kaynakları
-    min_worker_cpu: 16          # core
-    min_worker_memory_mb: 64000 # ~64 GB (bkz. aşağıdaki not)
-
+- hosts: new_workers
+  gather_facts: false
   tasks:
+    - name: Get FQDN from the target host
+      ansible.builtin.command: hostname -f
+      register: fqdn_result
+      changed_when: false
 
-    # ---- Kaynak kontrolü için sadece donanım fact'lerini topla ----
-    - name: Gather hardware facts
-      ansible.builtin.setup:
-        gather_subset:
-          - "!all"
-          - "!min"
-          - hardware
-
-    # ---- Requirement 7: worker'lar minimum CPU/memory'ye sahip olmalı ----
-    - name: Ensure worker meets minimum CPU and memory requirements
+    - name: Validate that FQDN matches inventory_hostname
       ansible.builtin.assert:
         that:
-          - ansible_processor_vcpus | int >= min_worker_cpu
-          - ansible_memtotal_mb | int >= min_worker_memory_mb
+          - fqdn_result.stdout == inventory_hostname
         fail_msg: >-
-          {{ inventory_hostname }}: insufficient resources -
-          CPU: {{ ansible_processor_vcpus }} core (min {{ min_worker_cpu }}),
-          Memory: {{ ansible_memtotal_mb }} MB (min {{ min_worker_memory_mb }} MB)
-        success_msg: >-
-          {{ inventory_hostname }}: resources OK
-          ({{ ansible_processor_vcpus }} core / {{ ansible_memtotal_mb }} MB)
-        quiet: true
+          Mismatch! inventory_hostname='{{ inventory_hostname }}' but
+          'hostname -f' returned '{{ fqdn_result.stdout }}'.
+        success_msg: "FQDN match confirmed: {{ inventory_hostname }}"
