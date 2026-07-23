@@ -1,0 +1,43 @@
+vars:
+    data_dirs:
+      - /var/lib/containerd
+      - /var/lib/kubelet
+    min_disk_gb: 500
+    # 500 GiB in bytes (binary). See the note below about GiB vs GB.
+    min_disk_bytes: "{{ min_disk_gb | int * 1073741824 }}"
+
+  tasks:
+    - name: Check the required data directories
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ data_dirs }}"
+      register: data_dir_stats
+
+    - name: Ensure the required data directories exist
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isdir
+        fail_msg: "{{ inventory_hostname }}: required directory {{ item.item }} is missing"
+        success_msg: "{{ inventory_hostname }}: directory {{ item.item }} exists"
+        quiet: true
+      loop: "{{ data_dir_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Ensure each data directory is on a disk larger than {{ min_disk_gb }} GB
+      vars:
+        mount_info: "{{ ansible_mounts | selectattr('mount', 'equalto', item) | list }}"
+        disk_bytes: "{{ (mount_info | first).size_total if (mount_info | length > 0) else 0 }}"
+      ansible.builtin.assert:
+        that:
+          - mount_info | length > 0
+          - disk_bytes | int > min_disk_bytes | int
+        fail_msg: >-
+          {{ inventory_hostname }}: {{ item }} is not a dedicated mount point, or its disk
+          ({{ (disk_bytes | int / 1073741824) | round(1) }} GiB) is not greater than {{ min_disk_gb }} GB
+        success_msg: >-
+          {{ inventory_hostname }}: {{ item }} is on a
+          {{ (disk_bytes | int / 1073741824) | round(1) }} GiB disk
+        quiet: true
+      loop: "{{ data_dirs }}"
