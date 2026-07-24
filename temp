@@ -35,3 +35,6 @@ spec:
             channel: stable-6.2
             source: redhat-operators
             sourceNamespace: openshift-marketplace
+---
+
+for node in $(oc get nodes -l node-role.kubernetes.io/physical-worker -o jsonpath='{.items[*].metadata.name}'); do count=$(oc debug node/$node -- chroot /host bash -c 'grep -c "^Slave Interface:" /proc/net/bonding/bond0 2>/dev/null || echo 0' 2>/dev/null | tr -d '\r\n '); echo "$node: $count"; done
