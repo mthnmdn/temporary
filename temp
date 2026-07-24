@@ -38,3 +38,15 @@ spec:
 ---
 
 for node in $(oc get nodes -l node-role.kubernetes.io/physical-worker -o jsonpath='{.items[*].metadata.name}'); do count=$(oc debug node/$node -- chroot /host bash -c 'grep -c "^Slave Interface:" /proc/net/bonding/bond0 2>/dev/null || echo 0' 2>/dev/null | tr -d '\r\n '); echo "$node: $count"; done
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cluster-logging
+  namespace: openshift-logging
+spec:
+  channel: stable-6.2
+  name: cluster-logging
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
