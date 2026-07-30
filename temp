@@ -2,6 +2,7 @@
 
 (sum by (namespace, deployment) (label_replace(kube_pod_container_resource_requests{resource="memory"}, "deployment", "$1", "pod", "(.+)-[0-9a-f]{8,10}-[a-z0-9]{5}$")) - sum by (namespace, deployment) (label_replace(container_memory_working_set_bytes{container!="", container!="POD"}, "deployment", "$1", "pod", "(.+)-[0-9a-f]{8,10}-[a-z0-9]{5}$"))) / 1024 / 1024 / 1024 >= 100
 
+(sum by (namespace, deployment) (kube_pod_container_resource_requests{resource="cpu", namespace="cards"} * on(namespace, pod) group_left(replicaset) label_replace(kube_pod_owner{namespace="cards", owner_kind="ReplicaSet"}, "replicaset", "$1", "owner_name", "(.+)") * on(namespace, replicaset) group_left(deployment) label_replace(kube_replicaset_owner{namespace="cards", owner_kind="Deployment"}, "deployment", "$1", "owner_name", "(.+)")) - sum by (namespace, deployment) (rate(container_cpu_usage_seconds_total{namespace="cards", container!="", container!="POD"}[5m]) * on(namespace, pod) group_left(replicaset) label_replace(kube_pod_owner{namespace="cards", owner_kind="ReplicaSet"}, "replicaset", "$1", "owner_name", "(.+)") * on(namespace, replicaset) group_left(deployment) label_replace(kube_replicaset_owner{namespace="cards", owner_kind="Deployment"}, "deployment", "$1", "owner_name", "(.+)"))) >= 1
 
 apiVersion: v1
 kind: Namespace
