@@ -1,58 +1,157 @@
-(sum by (namespace, deployment) (kube_pod_container_resource_requests{resource="memory", namespace="cards"} * on(namespace, pod) group_left(replicaset) label_replace(kube_pod_owner{namespace="cards", owner_kind="ReplicaSet"}, "replicaset", "$1", "owner_name", "(.+)") * on(namespace, replicaset) group_left(deployment) label_replace(kube_replicaset_owner{namespace="cards", owner_kind="Deployment"}, "deployment", "$1", "owner_name", "(.+)")) - sum by (namespace, deployment) (container_memory_working_set_bytes{namespace="cards", container!="", container!="POD"} * on(namespace, pod) group_left(replicaset) label_replace(kube_pod_owner{namespace="cards", owner_kind="ReplicaSet"}, "replicaset", "$1", "owner_name", "(.+)") * on(namespace, replicaset) group_left(deployment) label_replace(kube_replicaset_owner{namespace="cards", owner_kind="Deployment"}, "deployment", "$1", "owner_name", "(.+)"))) / 1024 / 1024 / 1024 >= 100
+# modüllerin idempotent olup olmadığını kontrol et. modüllerde state kullanımına bak.
+# birden fazla cluster'a ekleme yapmaya bak.
+- name: Get Tokens
+  hosts: master[0]
+  no_log: "{{ hide_logs | default(true) | bool }}"
+  become: true
+  gather_facts: false
+  vars_files:
+    - vars/default-variables.yaml
+  tasks:
+    - name: Generate Join Command
+      ansible.builtin.command: |
+        kubeadm token create --ttl 30m --print-join-command --kubeconfig {{ kubeconfig }}
+      register: join_command_output
+      changed_when: false
+      #when: false
 
-(sum by (namespace, deployment) (label_replace(kube_pod_container_resource_requests{resource="memory"}, "deployment", "$1", "pod", "(.+)-[0-9a-f]{8,10}-[a-z0-9]{5}$")) - sum by (namespace, deployment) (label_replace(container_memory_working_set_bytes{container!="", container!="POD"}, "deployment", "$1", "pod", "(.+)-[0-9a-f]{8,10}-[a-z0-9]{5}$"))) / 1024 / 1024 / 1024 >= 100
+    - name: Store join command as a fact on master
+      ansible.builtin.set_fact:
+        join_command: "{{ join_command_output.stdout }}"
+      #when: false
 
-(sum by (namespace, deployment) (kube_pod_container_resource_requests{resource="cpu", namespace="cards"} * on(namespace, pod) group_left(replicaset) label_replace(kube_pod_owner{namespace="cards", owner_kind="ReplicaSet"}, "replicaset", "$1", "owner_name", "(.+)") * on(namespace, replicaset) group_left(deployment) label_replace(kube_replicaset_owner{namespace="cards", owner_kind="Deployment"}, "deployment", "$1", "owner_name", "(.+)")) - sum by (namespace, deployment) (rate(container_cpu_usage_seconds_total{namespace="cards", container!="", container!="POD"}[5m]) * on(namespace, pod) group_left(replicaset) label_replace(kube_pod_owner{namespace="cards", owner_kind="ReplicaSet"}, "replicaset", "$1", "owner_name", "(.+)") * on(namespace, replicaset) group_left(deployment) label_replace(kube_replicaset_owner{namespace="cards", owner_kind="Deployment"}, "deployment", "$1", "owner_name", "(.+)"))) >= 1
+- name: Add new worker
+  hosts: workers:infra
+  no_log: "{{ hide_logs | default(true) | bool }}"
+  become: true
+  gather_facts: false
+  vars_files:
+    - vars/default-variables.yaml
+  tasks:
 
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: openshift-logging
-  labels:
-    openshift.io/cluster-monitoring: "true"
----
-apiVersion: policy.open-cluster-management.io/v1
-kind: Policy
-metadata:
-  name: policy-openshift-logging
-  namespace: open-cluster-management-policies
-spec:
-  remediationAction: enforce
-  disabled: false
-  policy-templates:
-    - objectDefinition:
-        apiVersion: policy.open-cluster-management.io/v1beta1
-        kind: OperatorPolicy
-        metadata:
-          name: openshift-logging-operator
-        spec:
-          remediationAction: enforce
-          severity: high
-          complianceType: musthave
-          upgradeApproval: Automatic
-          operatorGroup:
-            name: cluster-logging
-            namespace: openshift-logging
-            targetNamespaces:
-              - openshift-logging
-          subscription:
-            name: cluster-logging
-            namespace: openshift-logging
-            channel: stable-6.2
-            source: redhat-operators
-            sourceNamespace: openshift-marketplace
----
+    - name: Copy kubernetes.sh to workers
+      ansible.builtin.copy:
+        src: ./files/kubernetes-{{ kubernetes_version }}.sh
+        dest: /tmp/kubernetes-{{ kubernetes_version }}.sh
+        mode: '0755'
+      #when: false
 
-for node in $(oc get nodes -l node-role.kubernetes.io/physical-worker -o jsonpath='{.items[*].metadata.name}'); do count=$(oc debug node/$node -- chroot /host bash -c 'grep -c "^Slave Interface:" /proc/net/bonding/bond0 2>/dev/null || echo 0' 2>/dev/null | tr -d '\r\n '); echo "$node: $count"; done
----
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: cluster-logging
-  namespace: openshift-logging
-spec:
-  channel: stable-6.2
-  name: cluster-logging
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
-  installPlanApproval: Automatic
+#    - name: Fix CRLF
+#      ansible.builtin.command: "sed -i 's/\r$//' /tmp/kubernetes-{{ kubernetes_version }}.sh"
+#      #when: false
+
+    - name: Execute kubernetes.sh
+      ansible.builtin.command: |
+        /tmp/kubernetes-{{ kubernetes_version }}.sh
+      #when: false
+      args:
+        creates: /usr/lib/systemd/system/kubelet.service.d
+
+    - name: Delete kubernetes.sh
+      ansible.builtin.file:
+        path: /tmp/kubernetes-{{ kubernetes_version }}.sh
+        state: absent
+
+    - name: Add new worker
+      # Join komutu master host'unun fact'inden okunuyor.
+      ansible.builtin.command: |
+        {{ hostvars[groups['master'][0]]['join_command'] }} --node-name {{ inventory_hostname }}
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+      #when: false
+
+    - name: Set kubelet conf
+      # Host physical_workers grubundaysa physical, infra grubundaysa infra,
+      # aksi halde virtual kubelet config kullanılır.
+      ansible.builtin.copy:
+        src: >-
+          {{
+            physical_kubelet_config_source
+            if inventory_hostname in (groups['physical_workers'] | default([]))
+            else (
+              infra_kubelet_config_source
+              if inventory_hostname in (groups['infra'] | default([]))
+              else virtual_kubelet_config_source
+            )
+          }}
+        dest: /var/lib/kubelet/config.yaml
+        owner: root
+        group: root
+        mode: '0640'
+      notify: Restart kubelet
+      #when: false
+
+  handlers:
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: true
+
+- name: Label and Taint New Workers
+  hosts: master[0]
+  no_log: "{{ hide_logs | default(true) | bool }}"
+  become: true
+  gather_facts: false
+  vars_files:
+    - vars/default-variables.yaml
+  tasks:
+
+    - name: Label physical workers
+      #when: false
+      ansible.builtin.command: |
+        kubectl label no {{ worker }} {{ physical_worker_labels }} --kubeconfig {{ kubeconfig }}
+      loop: "{{ groups['physical_workers'] | default([]) }}"
+      loop_control:
+        loop_var: worker
+
+    - name: Label virtual workers
+      #when: false
+      ansible.builtin.command: |
+        kubectl label no {{ worker }} {{ virtual_worker_labels }} --kubeconfig {{ kubeconfig }}
+      loop: "{{ groups['virtual_workers'] | default([]) }}"
+      loop_control:
+        loop_var: worker
+
+    - name: Label infra workers
+      #when: false
+      ansible.builtin.command: |
+        kubectl label no {{ worker }} {{ infra_worker_labels }} --kubeconfig {{ kubeconfig }}
+      loop: "{{ groups['infra'] | default([]) }}"
+      loop_control:
+        loop_var: worker
+
+    - name: Add taint to worker
+      # workers grubundaki node'lara ortak taint uygulanır (infra ayrı grup).
+      #when: false
+      ansible.builtin.command: |
+        kubectl taint no {{ worker }} {{ default_worker_taints }} --kubeconfig {{ kubeconfig }}
+      loop: "{{ groups['workers'] | default([]) }}"
+      loop_control:
+        loop_var: worker
+
+    - name: Add taint to infra worker
+      # Infra sunucularına kendi taint'i uygulanır.
+      #when: false
+      ansible.builtin.command: |
+        kubectl taint no {{ worker }} {{ infra_worker_taints }} --kubeconfig {{ kubeconfig }}
+      loop: "{{ groups['infra'] | default([]) }}"
+      loop_control:
+        loop_var: worker
+
+#- name: Validate variables
+#  hosts: all
+#  gather_facts: false
+#  vars_files:
+#    - vars/default-variables.yaml
+#  tasks:
+#
+#    - name: Print all vars
+#      ansible.builtin.debug:
+#        msg:
+#          - "Physical Kubelet Config : {{ physical_kubelet_config_source }}"
+#          - "Virtual Kubelet Config : {{ virtual_kubelet_config_source }}"
+#          - "Kubeconfig : {{ kubeconfig }}"
+#          - "Physical Worker Labels : {{ physical_worker_labels }}"
+#          - "Virtual Worker Labels : {{ virtual_worker_labels }}"
+#          - "Default Worker Taints : {{ default_worker_taints }}"
