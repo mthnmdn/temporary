@@ -1,157 +1,138 @@
-# modüllerin idempotent olup olmadığını kontrol et. modüllerde state kullanımına bak.
-# birden fazla cluster'a ekleme yapmaya bak.
-- name: Get Tokens
-  hosts: master[0]
-  no_log: "{{ hide_logs | default(true) | bool }}"
-  become: true
-  gather_facts: false
-  vars_files:
-    - vars/default-variables.yaml
-  tasks:
-    - name: Generate Join Command
-      ansible.builtin.command: |
-        kubeadm token create --ttl 30m --print-join-command --kubeconfig {{ kubeconfig }}
-      register: join_command_output
-      changed_when: false
-      #when: false
-
-    - name: Store join command as a fact on master
-      ansible.builtin.set_fact:
-        join_command: "{{ join_command_output.stdout }}"
-      #when: false
-
-- name: Add new worker
-  hosts: workers:infra
-  no_log: "{{ hide_logs | default(true) | bool }}"
-  become: true
-  gather_facts: false
-  vars_files:
-    - vars/default-variables.yaml
-  tasks:
-
-    - name: Copy kubernetes.sh to workers
-      ansible.builtin.copy:
-        src: ./files/kubernetes-{{ kubernetes_version }}.sh
-        dest: /tmp/kubernetes-{{ kubernetes_version }}.sh
-        mode: '0755'
-      #when: false
-
-#    - name: Fix CRLF
-#      ansible.builtin.command: "sed -i 's/\r$//' /tmp/kubernetes-{{ kubernetes_version }}.sh"
-#      #when: false
-
-    - name: Execute kubernetes.sh
-      ansible.builtin.command: |
-        /tmp/kubernetes-{{ kubernetes_version }}.sh
-      #when: false
-      args:
-        creates: /usr/lib/systemd/system/kubelet.service.d
-
-    - name: Delete kubernetes.sh
-      ansible.builtin.file:
-        path: /tmp/kubernetes-{{ kubernetes_version }}.sh
-        state: absent
-
-    - name: Add new worker
-      # Join komutu master host'unun fact'inden okunuyor.
-      ansible.builtin.command: |
-        {{ hostvars[groups['master'][0]]['join_command'] }} --node-name {{ inventory_hostname }}
-      args:
-        creates: /etc/kubernetes/kubelet.conf
-      #when: false
-
-    - name: Set kubelet conf
-      # Host physical_workers grubundaysa physical, infra grubundaysa infra,
-      # aksi halde virtual kubelet config kullanılır.
-      ansible.builtin.copy:
-        src: >-
-          {{
-            physical_kubelet_config_source
-            if inventory_hostname in (groups['physical_workers'] | default([]))
-            else (
-              infra_kubelet_config_source
-              if inventory_hostname in (groups['infra'] | default([]))
-              else virtual_kubelet_config_source
-            )
-          }}
-        dest: /var/lib/kubelet/config.yaml
-        owner: root
-        group: root
-        mode: '0640'
-      notify: Restart kubelet
-      #when: false
-
-  handlers:
-    - name: Restart kubelet
-      ansible.builtin.systemd:
-        name: kubelet
-        state: restarted
-        daemon_reload: true
-
-- name: Label and Taint New Workers
-  hosts: master[0]
-  no_log: "{{ hide_logs | default(true) | bool }}"
-  become: true
-  gather_facts: false
-  vars_files:
-    - vars/default-variables.yaml
-  tasks:
-
-    - name: Label physical workers
-      #when: false
-      ansible.builtin.command: |
-        kubectl label no {{ worker }} {{ physical_worker_labels }} --kubeconfig {{ kubeconfig }}
-      loop: "{{ groups['physical_workers'] | default([]) }}"
-      loop_control:
-        loop_var: worker
-
-    - name: Label virtual workers
-      #when: false
-      ansible.builtin.command: |
-        kubectl label no {{ worker }} {{ virtual_worker_labels }} --kubeconfig {{ kubeconfig }}
-      loop: "{{ groups['virtual_workers'] | default([]) }}"
-      loop_control:
-        loop_var: worker
-
-    - name: Label infra workers
-      #when: false
-      ansible.builtin.command: |
-        kubectl label no {{ worker }} {{ infra_worker_labels }} --kubeconfig {{ kubeconfig }}
-      loop: "{{ groups['infra'] | default([]) }}"
-      loop_control:
-        loop_var: worker
-
-    - name: Add taint to worker
-      # workers grubundaki node'lara ortak taint uygulanır (infra ayrı grup).
-      #when: false
-      ansible.builtin.command: |
-        kubectl taint no {{ worker }} {{ default_worker_taints }} --kubeconfig {{ kubeconfig }}
-      loop: "{{ groups['workers'] | default([]) }}"
-      loop_control:
-        loop_var: worker
-
-    - name: Add taint to infra worker
-      # Infra sunucularına kendi taint'i uygulanır.
-      #when: false
-      ansible.builtin.command: |
-        kubectl taint no {{ worker }} {{ infra_worker_taints }} --kubeconfig {{ kubeconfig }}
-      loop: "{{ groups['infra'] | default([]) }}"
-      loop_control:
-        loop_var: worker
-
-#- name: Validate variables
-#  hosts: all
-#  gather_facts: false
-#  vars_files:
-#    - vars/default-variables.yaml
-#  tasks:
+#!/usr/bin/env bash
 #
-#    - name: Print all vars
-#      ansible.builtin.debug:
-#        msg:
-#          - "Physical Kubelet Config : {{ physical_kubelet_config_source }}"
-#          - "Virtual Kubelet Config : {{ virtual_kubelet_config_source }}"
-#          - "Kubeconfig : {{ kubeconfig }}"
-#          - "Physical Worker Labels : {{ physical_worker_labels }}"
-#          - "Virtual Worker Labels : {{ virtual_worker_labels }}"
-#          - "Default Worker Taints : {{ default_worker_taints }}"
+# Kullanim: ./dns-check.sh <sorgulanacak_adres>
+# Ornek   : ./dns-check.sh asd.com
+#
+# cluster-api.txt formati (her satir):
+#   cluster_adi - https://api.cluster.example.com:6443
+#
+# Her cluster'a user/pass ile login olur, NODE_ROLES icindeki rollere sahip
+# node'lari (birlesim + tekillestirme) doner ve her node uzerinde 'oc debug node'
+# ile dig calistirir. Node'un kendi resolver'inin dondurdugu cevabi ve cevabi
+# veren DNS sunucusunu loglar.
+
+set -o pipefail
+
+# ======================================================================
+# YAPILANDIRMA - kendinize gore duzenleyin
+# ======================================================================
+
+# OpenShift kullanici adi (tum cluster'larda ayni). Duz metin.
+OCP_USER="myuser"
+
+# Sifrenin YAZILI OLDUGU DOSYANIN yolu (sifre burada acik yazilmaz).
+# Ornek: echo -n 'gizli-sifre' > /path/ocp-pass && chmod 600 /path/ocp-pass
+OCP_PASS_FILE="/path/to/ocp-password"
+
+# Hedef node rolleri. Bir veya birden fazla rol yazabilirsiniz.
+# Ornek tek rol : NODE_ROLES=("physical-worker")
+# Ornek cok rol : NODE_ROLES=("physical-worker" "infra" "master")
+# Belirtilen rollerden HERHANGI BIRINE sahip node'lar dahil edilir (birlesim).
+NODE_ROLES=("physical-worker")
+
+# ======================================================================
+# Bundan sonrasini normalde degistirmeniz gerekmez
+# ======================================================================
+
+# ---- Girdi kontrolu ----
+QUERY="$1"
+if [[ -z "$QUERY" ]]; then
+  echo "Kullanim: $0 <sorgulanacak_adres>" >&2
+  echo "Ornek   : $0 asd.com" >&2
+  exit 1
+fi
+
+CLUSTER_FILE="cluster-api.txt"
+if [[ ! -f "$CLUSTER_FILE" ]]; then
+  echo "HATA: $CLUSTER_FILE bulunamadi." >&2
+  exit 1
+fi
+
+# ---- Sifre dosyasini oku ----
+if [[ ! -f "$OCP_PASS_FILE" ]]; then
+  echo "HATA: sifre dosyasi bulunamadi: $OCP_PASS_FILE" >&2
+  exit 1
+fi
+OCP_PASS="$(cat "$OCP_PASS_FILE")"
+if [[ -z "$OCP_PASS" ]]; then
+  echo "HATA: sifre dosyasi bos: $OCP_PASS_FILE" >&2
+  exit 1
+fi
+
+# Cikti log dosyasi (ekrana da yazar)
+LOG_FILE="dns-check-$(date +%Y%m%d-%H%M%S).log"
+
+# ---- Yardimci: log satiri yaz ----
+log_line() {
+  echo "$1" | tee -a "$LOG_FILE"
+}
+
+# ---- cluster-api.txt'yi satir satir oku ----
+while IFS= read -r RAW_LINE || [[ -n "$RAW_LINE" ]]; do
+  # Bos satir ve yorum satirlarini atla
+  [[ -z "$RAW_LINE" || "$RAW_LINE" =~ ^[[:space:]]*# ]] && continue
+
+  # "cluster_adi - api_adresi" formatini ayristir (ayrac: " - ")
+  CLUSTER_NAME="$(echo "$RAW_LINE" | awk -F' - ' '{print $1}' | xargs)"
+  API_ADDR="$(echo "$RAW_LINE" | awk -F' - ' '{print $2}' | xargs)"
+
+  if [[ -z "$CLUSTER_NAME" || -z "$API_ADDR" ]]; then
+    log_line "$(date '+%Y-%m-%d %H:%M:%S') | UYARI | satir ayristirilamadi: '$RAW_LINE'"
+    continue
+  fi
+
+  # ---- Cluster'a user/pass ile login ----
+  if ! oc login "$API_ADDR" \
+        --username="$OCP_USER" \
+        --password="$OCP_PASS" \
+        --insecure-skip-tls-verify=true >/dev/null 2>&1; then
+    log_line "$(date '+%Y-%m-%d %H:%M:%S') | cluster=$CLUSTER_NAME | HATA | login basarisiz: $API_ADDR"
+    continue
+  fi
+
+  # ---- Belirtilen rollerdeki node'lari topla (birlesim + tekillestirme) ----
+  NODES=""
+  for ROLE in "${NODE_ROLES[@]}"; do
+    ROLE_NODES="$(oc get nodes -l "node-role.kubernetes.io/${ROLE}=" \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+    NODES="${NODES}${ROLE_NODES}"$'\n'
+  done
+
+  # Bos satirlari at, sirala, tekillestir
+  NODES="$(echo "$NODES" | grep -v '^$' | sort -u)"
+
+  if [[ -z "$NODES" ]]; then
+    log_line "$(date '+%Y-%m-%d %H:%M:%S') | cluster=$CLUSTER_NAME | UYARI | rollere uygun node bulunamadi (roller: ${NODE_ROLES[*]})"
+    continue
+  fi
+
+  # ---- Her node uzerinde dig calistir ----
+  while IFS= read -r NODE; do
+    [[ -z "$NODE" ]] && continue
+
+    # Node uzerinde chroot ile host'un dig'ini calistir.
+    # +noall +answer -> sadece cevap bolumu, +stats -> ;; SERVER: satiri
+    DIG_OUT="$(oc debug node/"$NODE" --quiet -- \
+                 chroot /host dig +noall +answer +stats "$QUERY" 2>/dev/null)"
+
+    if [[ -z "$DIG_OUT" ]]; then
+      log_line "$(date '+%Y-%m-%d %H:%M:%S') | cluster=$CLUSTER_NAME | node=$NODE | query=$QUERY | HATA | dig calistirilamadi/cevap yok"
+      continue
+    fi
+
+    # ANSWER bolumundeki tum cevaplari (A/AAAA/CNAME) topla, virgulle birlestir
+    ANSWER="$(echo "$DIG_OUT" | awk '/[[:space:]]IN[[:space:]]/ {print $NF}' | paste -sd, -)"
+    [[ -z "$ANSWER" ]] && ANSWER="NXDOMAIN/bos"
+
+    # Cevabi veren DNS sunucusu (;; SERVER: 172.30.0.10#53(...) satirindan)
+    DNS_SERVER="$(echo "$DIG_OUT" | awk -F'SERVER: ' '/SERVER:/ {print $2}' | awk '{print $1}')"
+    [[ -z "$DNS_SERVER" ]] && DNS_SERVER="bilinmiyor"
+
+    log_line "$(date '+%Y-%m-%d %H:%M:%S') | cluster=$CLUSTER_NAME | node=$NODE | query=$QUERY | answer=$ANSWER | dns_server=$DNS_SERVER"
+
+  done <<< "$NODES"
+
+done < "$CLUSTER_FILE"
+
+echo ""
+echo "Tamamlandi. Log dosyasi: $LOG_FILE"
