@@ -1,49 +1,174 @@
+---
 # =============================================================================
-# ENVANTER (INI formati)
+# DECOM PLAYBOOK
 # =============================================================================
-# Kullanici SADECE su iki bilgiyi girer:
-#   1. Her cluster'in bir master (control-plane) node'u  -> kubectl buradan calisir
-#   2. O cluster'da decom edilecek node'lar
+# n cluster'dan paralel node decom. Her adim idempotent (tekrar calistirilabilir).
 #
-# Her cluster iki grup: <cluster>_master ve <cluster>_decom
-# "all_masters" ve "all_decom" meta-gruplari bu alt gruplari toplar; playbook'lar
-# bu iki grup uzerinden calisir. Yeni cluster = yeni iki grup + meta-gruplara ekleme.
-# Baska hicbir bilgiye gerek yok; her decom node'un master'i grup isminden turetilir.
-# =============================================================================
-
-# ----- CLUSTER 1 -------------------------------------------------------------
-[cluster1_master]
-cluster1-master-01 ansible_host=10.0.1.10
-
-[cluster1_decom]
-cluster1-worker-05 ansible_host=10.0.1.55
-cluster1-worker-06 ansible_host=10.0.1.56
-
-# ----- CLUSTER 2 -------------------------------------------------------------
-[cluster2_master]
-cluster2-master-01 ansible_host=10.0.2.10
-
-[cluster2_decom]
-cluster2-worker-03 ansible_host=10.0.2.53
-
-# ----- CLUSTER 3 (istediginiz kadar cogaltin) --------------------------------
-# [cluster3_master]
-# cluster3-master-01 ansible_host=10.0.3.10
+# Akis:
+#   1) PLAN     - ne silinecegini ekrana bas (salt-okunur)
+#   2) GUARD    - 'confirm=yes' verilmeden hicbir yikici islem yapilmaz
+#   3) CORDON   - master uzerinde kubectl cordon
+#   4) DRAIN    - master uzerinde kubectl drain
+#   5) DELETE   - master uzerinde kubectl delete node
+#   6) RESET    - decom node'un KENDISI uzerinde kubeadm reset
+#   7) CLEANUP  - decom node uzerinde artik temizligi (iptables, cni, .kube ...)
 #
-# [cluster3_decom]
-# cluster3-worker-01 ansible_host=10.0.3.51
-
-
+# Calistirma (onay platformdan/extra-var'dan gelir, playbook'ta pause yok):
+#   ansible-playbook -i inventory/hosts.yml playbooks/decom.yml -e confirm=yes
 # =============================================================================
-# ASAGIYA DOKUNMAYIN - alt gruplari otomatik toplayan meta-gruplar.
-# Yeni cluster eklerken ilgili _master ve _decom grubunu buraya da ekleyin.
-# =============================================================================
-[all_masters:children]
-cluster1_master
-cluster2_master
-# cluster3_master
 
-[all_decom:children]
-cluster1_decom
-cluster2_decom
-# cluster3_decom
+- name: "Node decom"
+  hosts: all_decom
+  gather_facts: false
+  strategy: free            # cluster'lar birbirini beklemesin, paralel ilerlesin
+  any_errors_fatal: false
+
+  vars_files:
+    - vars/default-variables.yaml
+
+  vars:
+    confirm: "no"           # -e confirm=yes verilmeden yikici adimlar atlanir
+
+  tasks:
+
+    # --- 0) Master cozumlemesi ------------------------------------------
+    - name: "Cluster master'i bulundu mu?"
+      ansible.builtin.assert:
+        that:
+          - my_master | length > 0
+        fail_msg: "'{{ inventory_hostname }}' icin master bulunamadi (grup isimlendirmesini kontrol edin)."
+        success_msg: "{{ inventory_hostname }} -> master: {{ my_master }}"
+
+    # --- 1) PLAN (salt-okunur) ------------------------------------------
+    - name: "PLAN: silinecek node"
+      ansible.builtin.debug:
+        msg: >-
+          [{{ my_master }}] cluster'indan '{{ inventory_hostname }}'
+          cordon -> drain -> delete -> kubeadm reset -> cleanup uygulanacak.
+
+    # --- 2) GUARD -------------------------------------------------------
+    - name: "Onay kontrolu"
+      ansible.builtin.assert:
+        that:
+          - confirm | string | lower in ['yes', 'true', 'y', '1']
+        fail_msg: >-
+          Onay yok. Yikici islemler ATLANDI. Devam icin: -e confirm=yes
+        success_msg: "Onay alindi, decom basliyor."
+
+    # --- Node hala var mi? (idempotency) --------------------------------
+    - name: "Node cluster'da mevcut mu?"
+      ansible.builtin.command:
+        cmd: "kubectl --kubeconfig {{ kubeconfig_path }} get node {{ inventory_hostname }}"
+      delegate_to: "{{ my_master }}"
+      register: node_exists
+      changed_when: false
+      failed_when: false
+
+    # --- 3) CORDON ------------------------------------------------------
+    - name: "Cordon (yeni pod almasin)"
+      ansible.builtin.command:
+        cmd: "kubectl --kubeconfig {{ kubeconfig_path }} cordon {{ inventory_hostname }}"
+      delegate_to: "{{ my_master }}"
+      register: cordon_res
+      changed_when: "'already cordoned' not in cordon_res.stdout"
+      failed_when: false
+      when: node_exists.rc == 0
+
+    # --- 4) DRAIN -------------------------------------------------------
+    - name: "Drain (pod'lari tahliye et)"
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig {{ kubeconfig_path }}
+          drain {{ inventory_hostname }}
+          --ignore-daemonsets
+          --delete-emptydir-data
+          --force
+          --grace-period={{ drain_grace_period }}
+          --timeout={{ drain_timeout }}s
+      delegate_to: "{{ my_master }}"
+      register: drain_res
+      changed_when: drain_res.rc == 0
+      failed_when: false
+      when: node_exists.rc == 0
+
+    - name: "Drain sonucu"
+      ansible.builtin.debug:
+        msg: "{{ 'Drain OK' if drain_res.rc == 0 else 'Drain uyari/hata: ' ~ (drain_res.stderr | default('')) }}"
+      when: node_exists.rc == 0
+
+    # --- 5) DELETE NODE -------------------------------------------------
+    - name: "kubectl delete node"
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig {{ kubeconfig_path }}
+          delete node {{ inventory_hostname }} --ignore-not-found=true
+      delegate_to: "{{ my_master }}"
+      register: delete_res
+      changed_when: "'deleted' in delete_res.stdout"
+      failed_when: delete_res.rc != 0
+
+    - name: "Node cluster'dan silindi"
+      ansible.builtin.debug:
+        msg: "'{{ inventory_hostname }}' cluster'dan cikarildi."
+
+    # --- 6) KUBEADM RESET (decom node'un KENDISI uzerinde) --------------
+    - name: "kubeadm var mi?"
+      ansible.builtin.command: "which kubeadm"
+      register: has_kubeadm
+      changed_when: false
+      failed_when: false
+
+    - name: "kubeadm reset --force"
+      ansible.builtin.command:
+        cmd: "kubeadm reset --force"
+      register: reset_res
+      changed_when: reset_res.rc == 0
+      failed_when: false
+      when: has_kubeadm.rc == 0
+
+    - name: "Reset sonucu"
+      ansible.builtin.debug:
+        msg: "{{ 'kubeadm reset OK' if (reset_res.rc | default(1)) == 0 else 'kubeadm reset atlandi/hata' }}"
+
+    # --- 7) CLEANUP (artik temizligi) ----------------------------------
+    - name: "kubelet servisini durdur"
+      ansible.builtin.systemd:
+        name: kubelet
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: "CNI ag yapilandirmasini temizle"
+      ansible.builtin.file:
+        path: /etc/cni/net.d
+        state: absent
+
+    - name: "Kalan kubernetes/kube dizinlerini temizle"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - "{{ ansible_env.HOME | default('/root') }}/.kube"
+
+    - name: "iptables kurallarini temizle"
+      ansible.builtin.shell:
+        cmd: |
+          iptables -F || true
+          iptables -t nat -F || true
+          iptables -t mangle -F || true
+          iptables -X || true
+      changed_when: true
+      failed_when: false
+
+    - name: "IPVS kurallarini temizle (varsa)"
+      ansible.builtin.shell:
+        cmd: "ipvsadm -C || true"
+      changed_when: true
+      failed_when: false
+
+    - name: "DECOM TAMAMLANDI"
+      ansible.builtin.debug:
+        msg: "'{{ inventory_hostname }}' ({{ my_master }} cluster'i) decom edildi ve temizlendi."
