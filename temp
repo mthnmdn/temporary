@@ -1,136 +1,21 @@
----
-# =============================================================================
-# VALIDATION PLAYBOOK  (SALT-OKUNUR)
-# =============================================================================
-# Hicbir sey degistirmez. Decom'a hazir olup olmadigini raporlar:
-#   - decom node cluster'da gercekten var mi?
-#   - yanlislikla bir control-plane node'u mu secilmis?
-#   - node su an cordon'lu mu (bilgi amacli)
-#   - drain TEMIZ biter mi? (kubectl drain --dry-run)
-#   - bu calistirmada silinecek node sayisi guvenlik esigini asiyor mu?
-#
-# Calistirma:
-#   ansible-playbook -i inventory/hosts.yml playbooks/validate.yml
-# =============================================================================
+- name: API sunucusu ayağa kalkana kadar bekle
+  ansible.builtin.command: >-
+    kubectl get --raw=/healthz --kubeconfig {{ kubeconfig_path }}
+  register: healthz
+  until: healthz.rc == 0 and healthz.stdout == "ok"
+  retries: 30
+  delay: 10
+  changed_when: false
 
-- name: "Node decom on-kontrol (salt-okunur)"
-  hosts: all_decom
-  gather_facts: false
-  strategy: free
-  any_errors_fatal: false
-
-  vars_files:
-    - vars/default-variables.yaml
-
-  tasks:
-
-    - name: "Cluster master'i tespit edilebildi mi?"
-      ansible.builtin.assert:
-        that:
-          - my_master | length > 0
-        fail_msg: >-
-          '{{ inventory_hostname }}' icin master bulunamadi. Grup isimlendirmesini
-          kontrol edin: '<cluster>_decom' ve '<cluster>_master' ayni <cluster> onekine sahip olmali.
-        success_msg: "Master: {{ my_master }}"
-
-    # --- Asagidaki kubectl komutlari ILGILI MASTER uzerinde calisir ---------
-
-    - name: "Node cluster'da var mi?"
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig {{ kubeconfig_path }}
-          get node {{ inventory_hostname }} -o json
-      delegate_to: "{{ my_master }}"
-      register: node_get
-      changed_when: false
-      failed_when: false
-
-    - name: "Node yoksa uyar (zaten silinmis olabilir)"
-      ansible.builtin.debug:
-        msg: "UYARI: '{{ inventory_hostname }}' cluster'da bulunamadi. Muhtemelen zaten decom edilmis."
-      when: node_get.rc != 0
-
-    - name: "Node bilgisini ayristir"
-      ansible.builtin.set_fact:
-        node_json: "{{ node_get.stdout | from_json }}"
-      when: node_get.rc == 0
-
-    - name: "GUVENLIK: Secilen node bir control-plane mi?"
-      ansible.builtin.assert:
-        that:
-          - "'node-role.kubernetes.io/control-plane' not in (node_json.metadata.labels | default({}))"
-          - "'node-role.kubernetes.io/master' not in (node_json.metadata.labels | default({}))"
-        fail_msg: >-
-          DURDURULDU: '{{ inventory_hostname }}' bir CONTROL-PLANE node'u gibi gorunuyor.
-          Decom listesinden cikarin.
-        success_msg: "'{{ inventory_hostname }}' worker node - OK."
-      when: node_get.rc == 0
-
-    - name: "Cordon durumu (bilgi)"
-      ansible.builtin.debug:
-        msg: >-
-          '{{ inventory_hostname }}' schedulable={{ not (node_json.spec.unschedulable | default(false)) }}
-          (cordon'lu ise decom sirasinda sorun yok)
-      when: node_get.rc == 0
-
-    - name: "DRAIN dry-run (temiz biter mi?)"
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig {{ kubeconfig_path }}
-          drain {{ inventory_hostname }}
-          --ignore-daemonsets
-          --delete-emptydir-data
-          --dry-run=server
-      delegate_to: "{{ my_master }}"
-      register: drain_dry
-      changed_when: false
-      failed_when: false
-      when: node_get.rc == 0
-
-    - name: "Drain dry-run sonucu"
-      ansible.builtin.debug:
-        msg: >-
-          {{ 'DRAIN TEMIZ BITER' if drain_dry.rc == 0
-             else 'DIKKAT - drain sorunlu olabilir (PDB/emptyDir/pod takilmasi): ' ~ drain_dry.stderr }}
-      when: node_get.rc == 0
-
-# =============================================================================
-# CLUSTER BAZINDA GUVENLIK ESIGI KONTROLU
-# =============================================================================
-- name: "Esik kontrolu: cluster basina silinecek node orani"
-  hosts: all_masters
-  gather_facts: false
-  strategy: free
-
-  vars_files:
-    - vars/default-variables.yaml
-
-  tasks:
-
-    - name: "Cluster'daki toplam node sayisi"
-      ansible.builtin.command:
-        cmd: >-
-          kubectl --kubeconfig {{ kubeconfig_path }}
-          get nodes --no-headers -o custom-columns=NAME:.metadata.name
-      changed_when: false
-      register: all_nodes
-
-    - name: "Bu cluster'in adini ve decom sayisini belirle"
-      ansible.builtin.set_fact:
-        _my_cluster: "{{ (group_names | reject('match', '^all_') | select('match', '.*_master$') | list | first) | regex_replace('_master$', '') }}"
-
-    - name: "Bu cluster'in decom node sayisi ve toplam"
-      ansible.builtin.set_fact:
-        decom_count: "{{ groups[_my_cluster ~ '_decom'] | default([]) | length }}"
-        total_count: "{{ all_nodes.stdout_lines | length }}"
-
-    - name: "GUVENLIK: silme orani esigi asiyor mu?"
-      ansible.builtin.assert:
-        that:
-          - total_count | int > 0
-          - (decom_count | int) * 100 <= (total_count | int) * (max_decom_percent | int)
-        fail_msg: >-
-          DURDURULDU ({{ _my_cluster }}): {{ decom_count }}/{{ total_count }} node decom edilecek,
-          bu izin verilen %{{ max_decom_percent }} esigini asiyor. Listeyi gozden gecirin.
-        success_msg: >-
-          {{ _my_cluster }}: {{ decom_count }}/{{ total_count }} node - esik icinde (<= %{{ max_decom_percent }}).
+- name: Kontrol düzlemi bileşen sağlığı
+  ansible.builtin.command: >-
+    kubectl get --raw={{ item }} --kubeconfig {{ kubeconfig_path }}
+  register: comp_health
+  until: comp_health.rc == 0
+  retries: 12
+  delay: 10
+  changed_when: false
+  loop:
+    - /livez
+    - /readyz
+    - /readyz/etcd
