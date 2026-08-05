@@ -1,9 +1,6 @@
 - name: Kernel modüllerini şimdi yükle
-  ansible.builtin.shell: |
-    if ! lsmod | grep -q "^{{ item }}\b"; then
-      modprobe {{ item }} && echo CHANGED
-    fi
+  ansible.builtin.command: "modprobe {{ item }}"
   loop: "{{ kernel_modules }}"
   register: modprobe_result
-  changed_when: "'CHANGED' in modprobe_result.stdout"
+  changed_when: false
   failed_when: modprobe_result.rc != 0
