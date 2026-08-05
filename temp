@@ -1,6 +1,5 @@
-- name: Kernel modüllerini şimdi yükle
-  ansible.builtin.command: "modprobe {{ item }}"
-  loop: "{{ kernel_modules }}"
-  register: modprobe_result
-  changed_when: false
-  failed_when: modprobe_result.rc != 0
+- name: Tüm swap satırlarını fstab'da yorumla
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\s+swap\s+.*)$'
+    replace: '#\1'
