@@ -308,3 +308,95 @@
           Decom BASLATILMADI. Envanteri/ortami duzeltip playbook'u tekrar calistirin.
         success_msg: "{{ inventory_hostname }} -> decom icin hazir."
         quiet: true
+---
+---
+# =============================================================================
+# vars/default-variables.yaml
+# =============================================================================
+# Ortam degistiginde SADECE bu dosya duzenlenir. Playbook'lara dokunulmaz.
+# =============================================================================
+
+# --- Baglanti ----------------------------------------------------------------
+kubeconfig_path: /etc/kubernetes/admin.conf
+
+
+# =============================================================================
+# SISTEM NAMESPACE'LERI
+# =============================================================================
+# Bu namespace'lerdeki pod'lar node'un "bos" sayilmasini ENGELLEMEZ.
+# Yeni bir infra bileseni (yeni bir operator, yeni bir storage/monitoring
+# stack'i vb.) devreye alindiginda namespace'ini BURAYA ekleyin; validation
+# playbook'unu degistirmeniz gerekmez.
+#
+# NOT: Kendi uygulama namespace'lerinizi buraya EKLEMEYIN. Buraya eklenen her
+# namespace, o namespace'teki pod'lar node uzerinde calisiyor olsa bile decom'a
+# izin verilmesi anlamina gelir.
+# =============================================================================
+system_namespaces:
+  # --- Kubernetes cekirdek ---
+  - kube-system
+  - kube-public
+  - kube-node-lease
+
+  # --- CNI (kullandiginiza gore sadelestirin) ---
+  - calico-system
+  - tigera-operator
+  - cilium-system
+
+  # --- Platform bilesenleri ---
+  - ingress-nginx
+  - cert-manager
+  - metallb-system
+  - monitoring
+  - logging
+  - velero
+  # - openebs
+  # - rook-ceph
+  # - istio-system
+
+
+# =============================================================================
+# KORUMALI NODE'LAR (control-plane / infra)
+# =============================================================================
+# Bu label anahtarlarindan VEYA taint anahtarlarindan herhangi biri node
+# uzerinde varsa, node decom edilemez. Kendi infra isimlendirmenize gore
+# genisletin (ornek: node-role.kubernetes.io/storage).
+# =============================================================================
+protected_node_labels:
+  - node-role.kubernetes.io/control-plane
+  - node-role.kubernetes.io/master
+  - node-role.kubernetes.io/infra
+  - node-role.kubernetes.io/etcd
+
+protected_node_taints:
+  - node-role.kubernetes.io/control-plane
+  - node-role.kubernetes.io/master
+  - node-role.kubernetes.io/infra
+
+
+# =============================================================================
+# KONTROL DAVRANISLARI
+# =============================================================================
+
+# true  -> DaemonSet'e ait pod'lar (hangi namespace'te olursa olsun) node'u
+#          dolu saymaz. DaemonSet pod'lari zaten drain ile
+#          --ignore-daemonsets kullanilarak gecilir.
+# false -> sadece system_namespaces listesi dikkate alinir.
+allow_daemonset_pods: true
+
+# true  -> node cordon (unschedulable) DEGILSE validation basarisiz olur.
+#          Decom oncesi node'un trafige kapatilmis olmasini sart kosar.
+# false -> cordon durumu sadece bilgi amacli raporlanir.
+require_cordoned: true
+
+# true  -> "kubectl drain --dry-run" temiz bitmezse validation basarisiz olur.
+# false -> sadece uyari basilir.
+drain_dryrun_fatal: true
+
+
+# =============================================================================
+# GUVENLIK ESIGI
+# =============================================================================
+# Tek calistirmada bir cluster'in node'larinin en fazla yuzde kaci decom
+# edilebilir. Yanlislikla tum cluster'i listeye yazmaya karsi koruma.
+max_decom_percent: 20
