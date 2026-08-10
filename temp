@@ -3,3 +3,11 @@ OCP audit kayıtlarının Splunk ortamına aktarılmasına yönelik çalışmala
 Audit kayıtlarının veri hacmi, doğrudan Splunk'a aktarım için elverişli olmadığından, gönderim öncesinde verinin filtrelenmesi gerekmektedir. Belirlenecek filtreleme kriterlerinin güvenlik ekiplerinin incelemesinden ve onayından geçmesi zorunludur; bu süreç ek değerlendirme süresi gerektirmektedir.
 
 Yapılan değerlendirmeler sonucunda, Splunk entegrasyonunun test edilmesi ve ardından tüm sistemlere yaygınlaştırılması ilave zaman gerektirecektir. Bu nedenlerle, sağlıklı bir karar alınabilmesi ve uygulama sürecinin doğru şekilde yürütülebilmesi adına yeni bir tarih önerilmektedir.
+
+
+---
+OCP audit kayıtlarının Splunk ortamına aktarılmasına yönelik çalışmalar kapsamında, log filtreleme faaliyetleri yürütülmüştür. Ancak Splunk entegrasyonu tarafında işlenecek veri boyutunun yüksek olması nedeniyle nihai karara varılamamıştır.
+
+Audit kayıtlarının veri hacmi, doğrudan Splunk'a aktarım için elverişli olmadığından, gönderim öncesinde verinin filtrelenmesi gerekmektedir. Belirlenecek filtreleme kriterlerinin güvenlik ekiplerinin incelemesinden ve onayından geçmesi gerekmektedir.
+
+Bunun yanı sıra, Splunk entegrasyonunun test edilmesi ve ardından tüm sistemlere yaygınlaştırılması da ilave zaman gerektirmektedir. Gerek güvenlik incelemesi, gerek test ve yaygınlaştırma adımlarının her biri ek süre gerektirdiğinden; sağlıklı bir karar alınabilmesi ve uygulama sürecinin doğru şekilde yürütülebilmesi adına yeni bir tarih önerilmektedir.
