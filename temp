@@ -1,17 +1,17 @@
-- name: Enable grpc histogram
-  ansible.builtin.replace:
-    path: /etc/containerd/config.toml
-    regexp: 'grpc_histogram = false'
-    replace: 'grpc_histogram = true'
+- name: Hub node'unu dinamik olarak tanımla
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars/default-variables.yaml
+  tasks:
+    - name: Hub node'unu ekle
+      add_host:
+        name: "{{ hub_node }}"
+        groups: hub
 
-- name: Set metrics address (single quotes)
-  ansible.builtin.replace:
-    path: /etc/containerd/config.toml
-    regexp: "(\\[plugins\\.'io\\.containerd\\.server\\.v1\\.metrics'\\][\\s\\S]*?)address = ''"
-    replace: "\\1address = '0.0.0.0:1338'"
-
-- name: Set metrics address (double quotes)
-  ansible.builtin.replace:
-    path: /etc/containerd/config.toml
-    regexp: '(\[plugins\."io\.containerd\.server\.v1\.metrics"\][\s\S]*?)address = ""'
-    replace: '\1address = "0.0.0.0:1338"'
+- name: Hub üzerinde çalış
+  hosts: hub
+  tasks:
+    - name: Örnek görev
+      debug:
+        msg: "{{ inventory_hostname }} üzerinde çalışıyorum"
