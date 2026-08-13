@@ -1,17 +1,35 @@
-- name: Hub node'unu dinamik olarak tanımla
-  hosts: localhost
-  gather_facts: false
-  vars_files:
-    - vars/default-variables.yaml
-  tasks:
-    - name: Hub node'unu ekle
-      add_host:
-        name: "{{ hub_node }}"
-        groups: hub
-
-- name: Hub üzerinde çalış
-  hosts: hub
-  tasks:
-    - name: Örnek görev
-      debug:
-        msg: "{{ inventory_hostname }} üzerinde çalışıyorum"
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: my-forwarder
+  namespace: openshift-logging
+spec:
+  serviceAccount:
+    name: my-log-collector-sa
+  filters:
+    - name: audit-policy-filter
+      type: kubeAPIAudit
+      kubeAPIAudit:
+        omitStages:
+          - "RequestReceived"
+        rules:
+          # 1) get/list/watch tamamen düşürülür
+          - level: None
+            verbs: ["get", "list", "watch"]
+          # 2) içinde "openshift" geçen namespace'lerdeki SA'lar da düşürülür
+          - level: None
+            users: ["system:serviceaccount:*openshift*:*"]
+          # catch-all: geri kalan her şey metadata seviyesinde
+          - level: Metadata
+  pipelines:
+    - name: audit-pipeline
+      inputRefs:
+        - audit
+      filterRefs:
+        - audit-policy-filter
+      outputRefs:
+        - my-output
+  outputs:
+    - name: my-output
+      type: # elasticsearch, loki, cloudwatch vb.
+      # ... output ayarları
