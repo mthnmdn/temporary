@@ -38,15 +38,14 @@
   connection: local
   gather_facts: false
 
+  vars_files:
+    - vars/validation-variables.yaml
+
   vars:
-    # Role suffixes that make up a cluster. Add a new role (e.g. gpu_workers)
-    # here and it is automatically included in the existence/overlap checks -
-    # provided the inventory uses the clusterN_<suffix> naming convention.
-    role_suffixes:
-      - master
-      - physical_workers
-      - virtual_workers
-      - infra
+    # --- Derived values (computed from 'groups' at run time) -------------
+    # Tunable settings (role_suffixes, allowed_k8s_versions,
+    # valid_host_name_regex, ...) live in vars/validation-variables.yaml.
+    #
     # Cluster ids derived from all groups named '<clusterN>_master':
     # cluster1_master -> cluster1, cluster2_master -> cluster2, ...
     cluster_ids: >-
@@ -56,11 +55,8 @@
         | map('regex_replace', '_master$', '')
         | list
       }}
-    allowed_k8s_versions:
-      - "1.33"
-      - "1.35"
-    # Hosts whose name does not start with lks/lk8s
-    invalid_named_hosts: "{{ groups['all'] | reject('match', '^(lks|lk8s)') | list }}"
+    # Hosts whose name does not match the naming convention
+    invalid_named_hosts: "{{ groups['all'] | reject('match', valid_host_name_regex) | list }}"
     # Every host that appears in at least one cluster role group
     role_assigned_hosts: >-
       {{
@@ -242,16 +238,11 @@
   hosts: all_physical_workers:all_virtual_workers:all_infras
   gather_facts: false
 
+  vars_files:
+    - vars/validation-variables.yaml
+
   vars:
-    required_free_ports:
-      - 10250   # kubelet API
-      - 10256   # kube-proxy health check
-    min_node_cpu: 16          # core
-    min_node_memory_mb: 62000 # ~64 GB
-    data_dirs:
-      - /var/lib/containerd
-      - /var/lib/kubelet
-    min_disk_gb: 490
+    # Derived from min_disk_gb (which is set in vars/validation-variables.yaml).
     min_disk_bytes: "{{ min_disk_gb | int * 1073741824 }}"
 
   tasks:
