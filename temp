@@ -1,136 +1,389 @@
-- name: Get Tokens
-  hosts: all_masters
-  no_log: "{{ hide_logs | default(true) | bool }}"
-  become: true
-  gather_facts: false
-  vars_files:
-    - vars/default-variables.yaml
-  tasks:
-    - name: Generate Join Command
-      ansible.builtin.command: |
-        kubeadm token create --ttl 30m --print-join-command --kubeconfig {{ kubeconfig_path }}
-      register: join_command_output
-      changed_when: false
+# sunucunun bonding ve interface tanımlarını kontrol et!
+---
+# Cluster inventory validation playbook (multi-cluster / n-cluster aware)
+# Call this first (e.g. via import_playbook).
+#
+# Behaviour:
+#   * All checks run to completion - a failure does NOT stop mid-way.
+#   * Results (pass AND fail) are collected and printed as ONE grouped report
+#     at the end of each play, grouped per cluster (plus a 'global' section).
+#   * If ANY check failed, the play fails at the very end via a final assert,
+#     so the following playbooks will not run.
+#
+# The cluster list is derived dynamically from groups named '<clusterN>_master'
+# (e.g. cluster1_master -> cluster1), so everything works for any number of
+# clusters without editing this file.
+#
+# ---------------------------------------------------------------------------
+# HOW TO ADD A NEW STRUCTURAL CHECK (Play 1):
+#   Add one more dict to the 'structural_checks' fact in the
+#   "Build structural checks" task. Each check is just:
+#       { 'cluster': <cluster id or 'global'>,
+#         'name':    <human readable name>,
+#         'ok':      <boolean expression - true means PASS>,
+#         'msg':     <detail shown only when it fails> }
+#   Per-cluster checks are built inside the cluster loop (cid is available);
+#   global checks are appended once, outside the loop.
+#   You do NOT need to touch the reporting/fail logic - it is generic.
+#
+# HOW TO ADD A NEW REMOTE CHECK (Play 2):
+#   1. Run whatever task is needed to gather data (stat/find/command/...),
+#      register its result.
+#   2. Append one dict to 'remote_checks' (same shape as above, without
+#      'cluster') in a "set_fact" task. The reporting/fail logic is shared.
+# ---------------------------------------------------------------------------
 
-    - name: Store join command as a fact on master
+- name: Validate inventory structure and variables
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Role suffixes that make up a cluster. Add a new role (e.g. gpu_workers)
+    # here and it is automatically included in the existence/overlap checks -
+    # provided the inventory uses the clusterN_<suffix> naming convention.
+    role_suffixes:
+      - master
+      - physical_workers
+      - virtual_workers
+      - infra
+    # Cluster ids derived from all groups named '<clusterN>_master':
+    # cluster1_master -> cluster1, cluster2_master -> cluster2, ...
+    cluster_ids: >-
+      {{
+        groups.keys()
+        | select('match', '^cluster[0-9]+_master$')
+        | map('regex_replace', '_master$', '')
+        | list
+      }}
+    allowed_k8s_versions:
+      - "1.33"
+      - "1.35"
+    # Hosts whose name does not start with lks/lk8s
+    invalid_named_hosts: "{{ groups['all'] | reject('match', '^(lks|lk8s)') | list }}"
+    # Every host that appears in at least one cluster role group
+    role_assigned_hosts: >-
+      {{
+        (cluster_ids | product(role_suffixes) | map('join', '_'))
+        | map('extract', groups)
+        | select('defined')
+        | flatten
+        | unique
+      }}
+    # Hosts that are in the inventory but not in any cluster role group
+    orphan_hosts: "{{ groups['all'] | difference(role_assigned_hosts) }}"
+
+  tasks:
+
+    # ===================================================================
+    # 1) GLOBAL checks (not tied to a specific cluster)
+    # ===================================================================
+    - name: Build global structural checks
       ansible.builtin.set_fact:
-        join_command: "{{ join_command_output.stdout }}"
+        structural_checks:
+          - cluster: global
+            name: "at least one cluster is defined"
+            ok: "{{ cluster_ids | length > 0 }}"
+            msg: >-
+              no clusterN_master groups found (expected e.g. cluster1_master)
+          - cluster: global
+            name: "kubernetes_version is one of {{ allowed_k8s_versions }}"
+            ok: "{{ kubernetes_version is defined and (kubernetes_version | string | trim) in allowed_k8s_versions }}"
+            msg: >-
+              current: '{{ kubernetes_version | default("undefined") | string | trim }}'
+          - cluster: global
+            name: "all host names start with lks/lk8s"
+            ok: "{{ invalid_named_hosts | length == 0 }}"
+            msg: "bad names: {{ invalid_named_hosts }}"
+          - cluster: global
+            name: "no orphan hosts (every host in a cluster role group)"
+            ok: "{{ orphan_hosts | length == 0 }}"
+            msg: "orphans: {{ orphan_hosts }}"
 
-- name: Add new worker
-  hosts: all_physical_workers:all_virtual_workers:all_infras
-  no_log: "{{ hide_logs | default(true) | bool }}"
-  become: true
-  gather_facts: false
-  vars_files:
-    - vars/default-variables.yaml
-  vars:
-    # Bu node'un ait oldugu cluster'i group_names'ten cikar ( or. cluster1).
-    cluster_id: >-
-      {{ group_names | select('match', '^cluster[0-9]+_') | first | regex_replace('_.*$', '') }}
-    # Bu cluster'in master node'u.
-    master_host: "{{ groups[cluster_id + '_master'][0] }}"
-  tasks:
-
-    - name: Copy kubernetes.sh to workers
-      ansible.builtin.copy:
-        src: ./files/kubernetes-{{ kubernetes_version }}.sh
-        dest: /tmp/kubernetes-{{ kubernetes_version }}.sh
-        mode: '0755'
-
-#    - name: Fix CRLF
-#      ansible.builtin.command: "sed -i 's/\r$//' /tmp/kubernetes-{{ kubernetes_version }}.sh"
-#      #when: false
-
-    - name: Execute kubernetes.sh
-      ansible.builtin.command: |
-        /tmp/kubernetes-{{ kubernetes_version }}.sh
-      args:
-        creates: /usr/lib/systemd/system/kubelet.service.d
-
-    - name: Delete kubernetes.sh
-      ansible.builtin.file:
-        path: /tmp/kubernetes-{{ kubernetes_version }}.sh
-        state: absent
-
-    - name: Add new worker
-      ansible.builtin.command: |
-        {{ hostvars[master_host]['join_command'] }} --node-name {{ inventory_hostname }}
-      args:
-        creates: /etc/kubernetes/kubelet.conf
-
-    - name: Set kubelet conf
-      ansible.builtin.copy:
-        src: >-
+    # ===================================================================
+    # 2) PER-CLUSTER existence + populated checks
+    #    (looped over cluster_ids; 'cid' is the current cluster)
+    # ===================================================================
+    - name: Build per-cluster structural checks
+      ansible.builtin.set_fact:
+        structural_checks: >-
           {{
-            physical_kubelet_config_source
-            if inventory_hostname in (groups['all_physical_workers'] | default([]))
-            else (
-              infra_kubelet_config_source
-              if inventory_hostname in (groups['all_infras'] | default([]))
-              else virtual_kubelet_config_source
-            )
+            structural_checks + [
+              {
+                'cluster': cid,
+                'name': 'all role groups exist',
+                'ok': (role_suffixes | map('regex_replace', '^', cid ~ '_') | list
+                        | difference(groups.keys() | list) | length == 0),
+                'msg': 'missing: ' ~ (role_suffixes | map('regex_replace', '^', cid ~ '_') | list
+                        | difference(groups.keys() | list) | join(', '))
+              },
+              {
+                'cluster': cid,
+                'name': 'master group is populated',
+                'ok': (groups[cid ~ '_master'] | default([]) | length >= 1),
+                'msg': 'master group empty - a control-plane node is required'
+              },
+              {
+                'cluster': cid,
+                'name': 'at least one worker or infra node',
+                'ok': ((groups[cid ~ '_physical_workers'] | default([]))
+                        | union(groups[cid ~ '_virtual_workers'] | default([]))
+                        | union(groups[cid ~ '_infra'] | default([]))
+                        | length > 0),
+                'msg': 'physical/virtual/infra all empty'
+              }
+            ]
           }}
-        dest: /var/lib/kubelet/config.yaml
-        owner: root
-        group: root
-        mode: '0640'
-      notify: Restart kubelet
-
-  handlers:
-    - name: Restart kubelet
-      ansible.builtin.systemd:
-        name: kubelet
-        state: restarted
-        daemon_reload: true
-
-- name: Label and Taint New Workers
-  hosts: all_masters
-  no_log: "{{ hide_logs | default(true) | bool }}"
-  become: true
-  gather_facts: false
-  vars_files:
-    - vars/default-variables.yaml
-  vars:
-    # Bu master'in ait oldugu cluster'i group_names'ten cikar (or. cluster1).
-    cluster_id: >-
-      {{ group_names | select('match', '^cluster[0-9]+_') | first | regex_replace('_.*$', '') }}
-  tasks:
-
-    - name: Label physical workers
-      ansible.builtin.command: |
-        kubectl label no {{ worker }} {{ physical_worker_labels }} --kubeconfig {{ kubeconfig_path }} --overwrite
-      loop: "{{ groups[cluster_id + '_physical_workers'] | default([]) }}"
+      loop: "{{ cluster_ids }}"
       loop_control:
-        loop_var: worker
+        loop_var: cid
 
-    - name: Label virtual workers
-      ansible.builtin.command: |
-        kubectl label no {{ worker }} {{ virtual_worker_labels }} --kubeconfig {{ kubeconfig_path }} --overwrite
-      loop: "{{ groups[cluster_id + '_virtual_workers'] | default([]) }}"
-      loop_control:
-        loop_var: worker
-
-    - name: Label infra
-      ansible.builtin.command: |
-        kubectl label no {{ infra }} {{ infra_labels }} --kubeconfig {{ kubeconfig_path }} --overwrite
-      loop: "{{ groups[cluster_id + '_infra'] | default([]) }}"
-      loop_control:
-        loop_var: infra
-
-    - name: Add taint to worker
-      ansible.builtin.command: |
-        kubectl taint no {{ worker }} {{ worker_taints }} --kubeconfig {{ kubeconfig_path }} --overwrite
+    # ===================================================================
+    # 3) PER-CLUSTER within-cluster overlap (each host in one role only)
+    #    looped over cluster x (suffix, suffix) unordered pairs
+    # ===================================================================
+    - name: Build within-cluster overlap checks
+      ansible.builtin.set_fact:
+        structural_checks: >-
+          {{
+            structural_checks + [
+              {
+                'cluster': item.0,
+                'name': 'no host in both ' ~ item.1 ~ ' and ' ~ item.2,
+                'ok': ((groups[item.0 ~ '_' ~ item.1] | default([]))
+                        | intersect(groups[item.0 ~ '_' ~ item.2] | default([]))
+                        | length == 0),
+                'msg': 'shared: ' ~ ((groups[item.0 ~ '_' ~ item.1] | default([]))
+                        | intersect(groups[item.0 ~ '_' ~ item.2] | default([])) | join(', '))
+              }
+            ]
+          }}
       loop: >-
         {{
-          (groups[cluster_id + '_physical_workers'] | default([]))
-          + (groups[cluster_id + '_virtual_workers'] | default([]))
+          cluster_ids
+          | product(role_suffixes)
+          | product(role_suffixes)
+          | map('flatten')
+          | list
         }}
       loop_control:
-        loop_var: worker
+        label: "{{ item.0 }}: {{ item.1 }} vs {{ item.2 }}"
+      when: item.1 < item.2   # each unordered pair once, no self-comparison
 
-    - name: Add taint to infra
-      ansible.builtin.command: |
-        kubectl taint no {{ infra }} {{ infra_taints }} --kubeconfig {{ kubeconfig_path }} --overwrite
-      loop: "{{ groups[cluster_id + '_infra'] | default([]) }}"
+    # ===================================================================
+    # 4) CROSS-CLUSTER isolation (no host shared between two clusters)
+    #    looped over unordered cluster pairs
+    # ===================================================================
+    - name: Build cross-cluster isolation checks
+      vars:
+        hosts_a: >-
+          {{ (role_suffixes | map('regex_replace', '^', item.0 ~ '_') | list)
+             | map('extract', groups) | select('defined') | flatten | unique }}
+        hosts_b: >-
+          {{ (role_suffixes | map('regex_replace', '^', item.1 ~ '_') | list)
+             | map('extract', groups) | select('defined') | flatten | unique }}
+      ansible.builtin.set_fact:
+        structural_checks: >-
+          {{
+            structural_checks + [
+              {
+                'cluster': item.0,
+                'name': 'no host shared with ' ~ item.1,
+                'ok': (hosts_a | intersect(hosts_b) | length == 0),
+                'msg': 'shared with ' ~ item.1 ~ ': ' ~ (hosts_a | intersect(hosts_b) | join(', '))
+              }
+            ]
+          }}
+      loop: "{{ cluster_ids | product(cluster_ids) | list }}"
       loop_control:
-        loop_var: infra
+        label: "{{ item.0 }} vs {{ item.1 }}"
+      when: item.0 < item.1   # each unordered cluster pair once
+
+    # ===================================================================
+    # 5) GROUPED REPORT + FINAL FAIL  (generic - do not edit when adding checks)
+    # ===================================================================
+    - name: Render grouped validation report
+      ansible.builtin.set_fact:
+        validation_report: |-
+          {% set order = (['global'] if structural_checks | selectattr('cluster', 'equalto', 'global') | list | length > 0 else []) + (structural_checks | map(attribute='cluster') | reject('equalto', 'global') | unique | list) %}
+          ============================================================
+          INVENTORY VALIDATION REPORT  (structural)
+          ============================================================
+          {% for c in order %}
+          {% set rows = structural_checks | selectattr('cluster', 'equalto', c) | list %}
+          {% set passed = rows | selectattr('ok') | list | length %}
+          === {{ c }} ===  ({{ passed }}/{{ rows | length }} passed)
+          {% for r in rows %}
+          {% if r.ok %}  [PASS] {{ r.name }}{% else %}  [FAIL] {{ r.name }}{% if r.msg %} -> {{ r.msg }}{% endif %}{% endif %}
+
+          {% endfor %}
+          {% endfor %}
+          ------------------------------------------------------------
+          {% set total_fail = structural_checks | rejectattr('ok') | list | length %}
+          RESULT: {{ structural_checks | length - total_fail }} passed, {{ total_fail }} failed
+          ============================================================
+
+    - name: Show validation report
+      ansible.builtin.debug:
+        msg: "{{ validation_report.split('\n') }}"
+
+    - name: Fail if any structural check failed
+      ansible.builtin.assert:
+        that:
+          - structural_checks | rejectattr('ok') | list | length == 0
+        fail_msg: >-
+          Structural validation failed
+          ({{ structural_checks | rejectattr('ok') | list | length }} check(s)).
+          See the report above; fix the inventory before continuing.
+        success_msg: "All structural checks passed"
+        quiet: true
+
+- name: Validate that worker, infra nodes are clean (no prior kubeadm install)
+  hosts: all_physical_workers:all_virtual_workers:all_infras
+  gather_facts: false
+
+  vars:
+    required_free_ports:
+      - 10250   # kubelet API
+      - 10256   # kube-proxy health check
+    min_node_cpu: 16          # core
+    min_node_memory_mb: 62000 # ~64 GB
+    data_dirs:
+      - /var/lib/containerd
+      - /var/lib/kubelet
+    min_disk_gb: 490
+    min_disk_bytes: "{{ min_disk_gb | int * 1073741824 }}"
+
+  tasks:
+
+    # ---- Gather everything the checks need (these tasks never assert) ----
+    - name: Verify the node is reachable
+      ansible.builtin.ping:
+
+    - name: Get FQDN from the target host
+      ansible.builtin.command: hostname -f
+      register: fqdn_result
+      changed_when: false
+
+    - name: Gather hardware facts
+      ansible.builtin.setup:
+        gather_subset:
+          - "!all"
+          - "!min"
+          - hardware
+
+    - name: Stat the required data directories
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ data_dirs }}"
+      register: data_dir_stats
+
+    - name: Stat kubelet.conf
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Look for cilium CNI config under /etc/cni/net.d
+      ansible.builtin.find:
+        paths: /etc/cni/net.d
+        patterns: "*cilium*"
+        file_type: any
+      register: cilium_cni
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Probe required kubernetes ports (never fails here; evaluated below)
+      ansible.builtin.wait_for:
+        port: "{{ item }}"
+        state: stopped
+        timeout: 3
+      loop: "{{ required_free_ports }}"
+      register: port_probe
+      ignore_errors: true
+
+    # ---- Turn gathered data into pass/fail records ----
+    # To add a remote check: gather data above, then append one dict here.
+    - name: Build remote checks
+      vars:
+        missing_dirs: >-
+          {{ data_dir_stats.results
+             | rejectattr('stat.isdir', 'defined')
+             | map(attribute='item') | list
+             + (data_dir_stats.results
+                | selectattr('stat.isdir', 'defined')
+                | rejectattr('stat.isdir') | map(attribute='item') | list) }}
+        busy_ports: >-
+          {{ port_probe.results | default([])
+             | selectattr('failed', 'defined') | selectattr('failed')
+             | map(attribute='item') | list }}
+      ansible.builtin.set_fact:
+        remote_checks:
+          - name: "FQDN matches inventory_hostname"
+            ok: "{{ fqdn_result.stdout == inventory_hostname }}"
+            msg: "hostname -f='{{ fqdn_result.stdout }}' != '{{ inventory_hostname }}'"
+          - name: "CPU >= {{ min_node_cpu }} cores"
+            ok: "{{ ansible_processor_vcpus | int >= min_node_cpu }}"
+            msg: "has {{ ansible_processor_vcpus }} cores"
+          - name: "Memory >= {{ min_node_memory_mb }} MB"
+            ok: "{{ ansible_memtotal_mb | int >= min_node_memory_mb }}"
+            msg: "has {{ ansible_memtotal_mb }} MB"
+          - name: "data directories exist ({{ data_dirs | join(', ') }})"
+            ok: "{{ missing_dirs | length == 0 }}"
+            msg: "missing/not-a-dir: {{ missing_dirs }}"
+          - name: "no prior kubeadm install (kubelet.conf absent)"
+            ok: "{{ not kubelet_conf.stat.exists }}"
+            msg: "/etc/kubernetes/kubelet.conf exists"
+          - name: "no cilium CNI config under /etc/cni/net.d"
+            ok: "{{ cilium_cni.matched == 0 }}"
+            msg: "found: {{ cilium_cni.files | map(attribute='path') | list }}"
+          - name: "kubelet service not running (installed is fine)"
+            ok: "{{ ansible_facts.services['kubelet.service'].state | default('stopped') != 'running' }}"
+            msg: "kubelet is running - systemctl stop kubelet"
+          - name: "required ports free ({{ required_free_ports | join(', ') }})"
+            ok: "{{ busy_ports | length == 0 }}"
+            msg: "in use: {{ busy_ports }}"
+
+    # ---- Disk-size check is per-directory, so build it as its own records ----
+    - name: Add disk-size checks
+      vars:
+        mount_info: "{{ ansible_mounts | selectattr('mount', 'equalto', item) | list }}"
+        disk_bytes: "{{ (mount_info | first).size_total if (mount_info | length > 0) else 0 }}"
+      ansible.builtin.set_fact:
+        remote_checks: >-
+          {{
+            remote_checks + [
+              {
+                'name': item ~ ' on a disk > ' ~ min_disk_gb ~ ' GB',
+                'ok': (mount_info | length > 0 and (disk_bytes | int > min_disk_bytes | int)),
+                'msg': (item ~ ' not a dedicated mount or too small ('
+                        ~ ((disk_bytes | int / 1073741824) | round(1)) ~ ' GiB)')
+              }
+            ]
+          }}
+      loop: "{{ data_dirs }}"
+
+    # ---- Grouped report per node + final fail (generic) ----
+    - name: Render remote validation report
+      ansible.builtin.set_fact:
+        node_report: |-
+          {% set passed = remote_checks | selectattr('ok') | list | length %}
+          === {{ inventory_hostname }} ===  ({{ passed }}/{{ remote_checks | length }} passed)
+          {% for r in remote_checks %}
+          {% if r.ok %}  [PASS] {{ r.name }}{% else %}  [FAIL] {{ r.name }}{% if r.msg %} -> {{ r.msg }}{% endif %}{% endif %}
+
+          {% endfor %}
+
+    - name: Show remote validation report
+      ansible.builtin.debug:
+        msg: "{{ node_report.split('\n') }}"
+
+    - name: Fail if any remote check failed on this node
+      ansible.builtin.assert:
+        that:
+          - remote_checks | rejectattr('ok') | list | length == 0
+        fail_msg: >-
+          {{ inventory_hostname }}: {{ remote_checks | rejectattr('ok') | list | length }}
+          remote check(s) failed. See the report above.
+        success_msg: "{{ inventory_hostname }}: all remote checks passed"
+        quiet: true
