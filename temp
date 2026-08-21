@@ -1,11 +1,404 @@
-    - name: Configure git identity (repo-local)
-      ansible.builtin.command: git config --local {{ item.key }} "{{ item.value }}"
-      args:
-        chdir: /tmp/{{ repo_name }}/
-      loop:
-        - { key: "user.email", value: "{{ username }}@akbank.com" }
-        - { key: "user.name", value: "{{ username }}" }
-        - { key: "core.sshCommand", value: "ssh -i ~/.ssh/tfs_k8s_id_rsa" }
+# CONTAINERD VS. EKLENEBİLİR.
+# HUB ORTAMINA ERİŞİM KONTROLÜ YAP.
+---
+# =============================================================================
+# Provizyon (cluster kurulum) inventory ve ön koşul doğrulaması - TEK CLUSTER
+# =============================================================================
+# Kullanım: main.yaml'ın en başında import_playbook ile çağrılır.
+#   - import_playbook: playbooks/00-validate-inventory.yaml
+#
+# Davranış (node ekleme doğrulamasıyla aynı model):
+#   * Tüm kontroller sonuna kadar çalışır - bir hata ortada durdurmaz.
+#   * Sonuçlar (başarılı VE başarısız) toplanır ve her play sonunda TEK
+#     gruplu rapor olarak yazdırılır: [global] ve node bazlı bölümler.
+#   * Herhangi bir kontrol başarısızsa VEYA bir node erişilemezse, en sondaki
+#     kapanış play'i fail eder; böylece main.yaml'daki sonraki playbook'lar
+#     çalışmaz.
+#
+# ---------------------------------------------------------------------------
+# YENİ KONTROL EKLEME (modüler):
+#   Global kontrol  -> Play 1'deki "Build global checks" veya ilgili set_fact
+#                      task'ına bir kayıt ekleyin:
+#                        { name: <ad>, ok: <true=BAŞARILI ifade>, msg: <hata detayı> }
+#   Node kontrolü   -> Play 2'de gereken veriyi toplayın (stat/find/command),
+#                      sonra 'remote_checks' listesine aynı biçimde bir kayıt ekleyin.
+#   Raporlama ve fail mantığı geneldir; ona dokunmanız gerekmez.
+#
+# Ayar değişkenleri:  vars/default-validation-variables.yaml
+# Provizyon değişkenleri (denetlenenler): vars/default-variables.yaml,
+#   vars/node-setup-variables.yaml ve inventory [all:vars]
+# =============================================================================
+
+- name: Validate inventory structure and variables (global)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/default-validation-variables.yaml   # doğrulama ayarları
+    - ../vars/default-variables.yaml              # denetlenen provizyon değişkenleri
+    - ../vars/node-setup-variables.yaml           # denetlenen provizyon değişkenleri
+
+  vars:
+    # --- Türetilmiş değerler (ayar değil; burada hesaplanır) --------------
+    # İsim kuralına uymayan host'lar
+    invalid_named_hosts: "{{ groups['all'] | reject('match', valid_host_name_regex) | list }}"
+    # pfx beklenen ad ve yerel yol (files/ altında)
+    expected_pfx_name: "{{ expected_pfx_name_template }}"
+    expected_pfx_path: "{{ playbook_dir }}/../files/{{ expected_pfx_name }}"
+
+  tasks:
+
+    # ===================================================================
+    # 1) pfx dosyası kontrolü (git node değil, localhost/files altında)
+    # ===================================================================
+    - name: Stat the pfx file under files/
+      ansible.builtin.stat:
+        path: "{{ expected_pfx_path }}"
+      register: pfx_file
+
+    # ===================================================================
+    # 2) SSH key kontrolü - git node (master[0]) üzerinde.
+    #    Git node erişilemezse bu bir doğrulama hatasıdır (block/rescue).
+    # ===================================================================
+    - name: Check ssh key on the git node (master[0])
+      block:
+        - name: Stat the ssh key on the git node
+          ansible.builtin.stat:
+            path: "{{ expected_ssh_key_path }}"
+          delegate_to: "{{ groups['master'][0] }}"
+          register: ssh_key_file
+
+        - name: Record ssh key result (reachable)
+          ansible.builtin.set_fact:
+            ssh_key_check:
+              ok: "{{ ssh_key_file.stat.exists }}"
+              msg: "ssh key not found at '{{ expected_ssh_key_path }}' on git node"
+      rescue:
+        - name: Record ssh key result (git node unreachable/failed)
+          ansible.builtin.set_fact:
+            ssh_key_check:
+              ok: false
+              msg: >-
+                git node (master[0]) unreachable or ssh key check failed:
+                {{ ansible_failed_task.name | default('unknown') }}
+
+    # ===================================================================
+    # 3) Global kontrolleri veri olarak kur
+    # ===================================================================
+    - name: Build global checks
+      ansible.builtin.set_fact:
+        global_checks:
+          - name: "master group has at least {{ min_master_count }} hosts"
+            ok: "{{ groups['master'] | default([]) | length >= min_master_count }}"
+            msg: "master count = {{ groups['master'] | default([]) | length }}"
+          - name: "infra group has at least {{ min_infra_count }} hosts"
+            ok: "{{ groups['infra'] | default([]) | length >= min_infra_count }}"
+            msg: "infra count = {{ groups['infra'] | default([]) | length }}"
+          - name: "no host shared across master/infra/workers"
+            ok: >-
+              {{ (groups['master'] | default([]) | intersect(groups['infra'] | default([])) | length == 0)
+                 and (groups['master'] | default([]) | intersect(groups['workers'] | default([])) | length == 0)
+                 and (groups['infra'] | default([]) | intersect(groups['workers'] | default([])) | length == 0) }}
+            msg: >-
+              overlaps -> m∩i={{ groups['master'] | default([]) | intersect(groups['infra'] | default([])) }},
+              m∩w={{ groups['master'] | default([]) | intersect(groups['workers'] | default([])) }},
+              i∩w={{ groups['infra'] | default([]) | intersect(groups['workers'] | default([])) }}
+          - name: "cluster_name matches {{ valid_cluster_name_regex }}"
+            ok: "{{ cluster_name is defined and (cluster_name is match(valid_cluster_name_regex)) }}"
+            msg: "cluster_name = '{{ cluster_name | default('undefined') }}'"
+          - name: "all host names match {{ valid_host_name_regex }}"
+            ok: "{{ invalid_named_hosts | length == 0 }}"
+            msg: "bad names: {{ invalid_named_hosts }}"
+          - name: "env is one of {{ allowed_env }}"
+            ok: "{{ env is defined and env in allowed_env }}"
+            msg: "env = '{{ env | default('undefined') }}'"
+          - name: "cluster_env is one of {{ allowed_cluster_env }}"
+            ok: "{{ cluster_env is defined and cluster_env in allowed_cluster_env }}"
+            msg: "cluster_env = '{{ cluster_env | default('undefined') }}'"
+          - name: "env and cluster_env are consistent"
+            ok: >-
+              {{ env is defined and cluster_env is defined
+                 and env in env_cluster_env_map
+                 and cluster_env == env_cluster_env_map[env] }}
+            msg: >-
+              env='{{ env | default('undefined') }}' expects
+              '{{ env_cluster_env_map[env] | default('?') }}', got
+              '{{ cluster_env | default('undefined') }}'
+          - name: "pfx file present under files/"
+            ok: "{{ pfx_file.stat.exists }}"
+            msg: "pfx not found at '{{ expected_pfx_path }}'"
+          - name: "ssh key present on git node (master[0])"
+            ok: "{{ ssh_key_check.ok }}"
+            msg: "{{ ssh_key_check.msg }}"
+
+    # ===================================================================
+    # 4) Zorunlu değişken kontrollerini ekle (tanımlı ve boş değil)
+    # ===================================================================
+    - name: Add required-variable checks
+      ansible.builtin.set_fact:
+        global_checks: >-
+          {{
+            global_checks + [
+              {
+                'name': "required var '" ~ item ~ "' is defined and not empty",
+                'ok': (vars[item] is defined and (vars[item] | string | trim | length > 0)),
+                'msg': "'" ~ item ~ "' is undefined or empty"
+              }
+            ]
+          }}
+      loop: "{{ required_vars }}"
       loop_control:
-        label: "{{ item.key }}"
-      changed_when: false
+        label: "{{ item }}"
+
+    # ===================================================================
+    # 5) Gruplu rapor + sonucu fact'e yaz (fail ETME - kapanış karar verir)
+    # ===================================================================
+    - name: Render global validation report
+      ansible.builtin.set_fact:
+        global_report: |-
+          {% set passed = global_checks | selectattr('ok') | list | length %}
+          ============================================================
+          PROVISION VALIDATION REPORT
+          ============================================================
+          === [global] ===  ({{ passed }}/{{ global_checks | length }} passed)
+          {% for r in global_checks %}
+          {% if r.ok %}  [PASS] {{ r.name }}{% else %}  [FAIL] {{ r.name }}{% if r.msg %} -> {{ r.msg }}{% endif %}{% endif %}
+
+          {% endfor %}
+
+    - name: Show global validation report
+      ansible.builtin.debug:
+        msg: "{{ global_report.split('\n') }}"
+
+    - name: Record global failure info
+      ansible.builtin.set_fact:
+        global_failed_count: "{{ global_checks | rejectattr('ok') | list | length }}"
+        global_failed_names: "{{ global_checks | rejectattr('ok') | map(attribute='name') | list }}"
+
+- name: Validate that master, infra, worker nodes are clean (hub excluded)
+  hosts: master:infra:workers
+  gather_facts: false
+  # Bir node erişilemezse play durmasın; diğerleri denetlensin. Erişilemeyen
+  # node kapanış play'inde (sonuç bildirmeyen node) hata sayılır.
+  ignore_unreachable: true
+
+  vars_files:
+    - ../vars/default-validation-variables.yaml
+
+  vars:
+    min_disk_bytes: "{{ min_disk_gb | int * 1073741824 }}"
+
+  tasks:
+
+    - name: Run all remote checks for this node
+      block:
+
+        - name: Verify the node is reachable
+          ansible.builtin.ping:
+
+        - name: Get FQDN from the target host
+          ansible.builtin.command: hostname -f
+          register: fqdn_result
+          changed_when: false
+
+        - name: Gather hardware facts
+          ansible.builtin.setup:
+            gather_subset:
+              - "!all"
+              - "!min"
+              - hardware
+
+        - name: Stat the required data directories
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop: "{{ data_dirs }}"
+          register: data_dir_stats
+
+        - name: Stat kubelet.conf
+          ansible.builtin.stat:
+            path: /etc/kubernetes/kubelet.conf
+          register: kubelet_conf
+
+        - name: Look for cilium CNI config under /etc/cni/net.d
+          ansible.builtin.find:
+            paths: /etc/cni/net.d
+            patterns: "*cilium*"
+            file_type: any
+          register: cilium_cni
+
+        - name: Gather service facts
+          ansible.builtin.service_facts:
+
+        - name: Probe required kubernetes ports (evaluated below)
+          ansible.builtin.wait_for:
+            port: "{{ item }}"
+            state: stopped
+            timeout: 3
+          loop: "{{ required_free_ports }}"
+          register: port_probe
+          ignore_errors: true
+
+        # ---- Toplanan veriyi pass/fail kayıtlarına çevir ----
+        - name: Build remote checks
+          vars:
+            missing_dirs: >-
+              {{ data_dir_stats.results
+                 | rejectattr('stat.isdir', 'defined')
+                 | map(attribute='item') | list
+                 + (data_dir_stats.results
+                    | selectattr('stat.isdir', 'defined')
+                    | rejectattr('stat.isdir') | map(attribute='item') | list) }}
+            busy_ports: >-
+              {{ port_probe.results | default([])
+                 | selectattr('failed', 'defined') | selectattr('failed')
+                 | map(attribute='item') | list }}
+          ansible.builtin.set_fact:
+            remote_checks:
+              - name: "FQDN matches inventory_hostname"
+                ok: "{{ fqdn_result.stdout == inventory_hostname }}"
+                msg: "hostname -f='{{ fqdn_result.stdout }}' != '{{ inventory_hostname }}'"
+              - name: "CPU >= {{ min_node_cpu }} cores"
+                ok: "{{ ansible_processor_vcpus | int >= min_node_cpu }}"
+                msg: "has {{ ansible_processor_vcpus }} cores"
+              - name: "Memory >= {{ min_node_memory_mb }} MB"
+                ok: "{{ ansible_memtotal_mb | int >= min_node_memory_mb }}"
+                msg: "has {{ ansible_memtotal_mb }} MB"
+              - name: "data directories exist ({{ data_dirs | join(', ') }})"
+                ok: "{{ missing_dirs | length == 0 }}"
+                msg: "missing/not-a-dir: {{ missing_dirs }}"
+              - name: "no prior kubeadm install (kubelet.conf absent)"
+                ok: "{{ not kubelet_conf.stat.exists }}"
+                msg: "/etc/kubernetes/kubelet.conf exists"
+              - name: "no cilium CNI config under /etc/cni/net.d"
+                ok: "{{ cilium_cni.matched == 0 }}"
+                msg: "found: {{ cilium_cni.files | map(attribute='path') | list }}"
+              - name: "kubelet service not running (installed is fine)"
+                ok: "{{ ansible_facts.services['kubelet.service'].state | default('stopped') != 'running' }}"
+                msg: "kubelet is running - systemctl stop kubelet"
+              - name: "required ports free ({{ required_free_ports | join(', ') }})"
+                ok: "{{ busy_ports | length == 0 }}"
+                msg: "in use: {{ busy_ports }}"
+
+        - name: Add disk-size checks
+          vars:
+            mount_info: "{{ ansible_mounts | selectattr('mount', 'equalto', item) | list }}"
+            disk_bytes: "{{ (mount_info | first).size_total if (mount_info | length > 0) else 0 }}"
+          ansible.builtin.set_fact:
+            remote_checks: >-
+              {{
+                remote_checks + [
+                  {
+                    'name': item ~ ' on a disk > ' ~ min_disk_gb ~ ' GB',
+                    'ok': (mount_info | length > 0 and (disk_bytes | int > min_disk_bytes | int)),
+                    'msg': (item ~ ' not a dedicated mount or too small ('
+                            ~ ((disk_bytes | int / 1073741824) | round(1)) ~ ' GiB)')
+                  }
+                ]
+              }}
+          loop: "{{ data_dirs }}"
+
+        - name: Render remote validation report
+          ansible.builtin.set_fact:
+            node_report: |-
+              {% set passed = remote_checks | selectattr('ok') | list | length %}
+              === {{ inventory_hostname }} ===  ({{ passed }}/{{ remote_checks | length }} passed)
+              {% for r in remote_checks %}
+              {% if r.ok %}  [PASS] {{ r.name }}{% else %}  [FAIL] {{ r.name }}{% if r.msg %} -> {{ r.msg }}{% endif %}{% endif %}
+
+              {% endfor %}
+
+        - name: Show remote validation report
+          ansible.builtin.debug:
+            msg: "{{ node_report.split('\n') }}"
+
+        - name: Record this node's remote result
+          ansible.builtin.set_fact:
+            remote_check_summary:
+              reported: true
+              failed_count: "{{ remote_checks | rejectattr('ok') | list | length }}"
+              failed_names: "{{ remote_checks | rejectattr('ok') | map(attribute='name') | list }}"
+
+      rescue:
+        - name: Record this node as failed
+          ansible.builtin.set_fact:
+            remote_check_summary:
+              reported: true
+              failed_count: 1
+              failed_names: >-
+                {{ ['unexpected error during checks: '
+                    ~ (ansible_failed_task.name | default('unknown'))] }}
+
+- name: Final validation gate (aggregate global + node results)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  # Tek karar noktası: global hata varsa, bir node kontrolü patladıysa veya
+  # denetlenmesi gereken bir node hiç sonuç bildirmediyse (erişilemez) fail eder.
+
+  vars:
+    expected_remote_nodes: >-
+      {{
+        (groups['master'] | default([]))
+        + (groups['infra'] | default([]))
+        + (groups['workers'] | default([]))
+        | unique
+      }}
+    reported_nodes: >-
+      {{
+        expected_remote_nodes
+        | map('extract', hostvars)
+        | selectattr('remote_check_summary', 'defined')
+        | map(attribute='inventory_hostname')
+        | list
+      }}
+    unreachable_nodes: "{{ expected_remote_nodes | difference(reported_nodes) }}"
+    failed_remote_nodes: >-
+      {{
+        reported_nodes
+        | map('extract', hostvars)
+        | rejectattr('remote_check_summary.failed_count', 'equalto', '0')
+        | rejectattr('remote_check_summary.failed_count', 'equalto', 0)
+        | map(attribute='inventory_hostname')
+        | list
+      }}
+    global_fail_count: "{{ global_failed_count | default(0) | int }}"
+
+  tasks:
+
+    - name: Build final summary
+      ansible.builtin.set_fact:
+        final_summary: |-
+          ============================================================
+          VALIDATION SUMMARY
+          ============================================================
+          [global]  {{ ((global_fail_count | int) == 0) | ternary('OK', 'FAILED') }}{% if global_fail_count | int > 0 %} - {{ global_fail_count }} failed: {{ global_failed_names | default([]) | join(', ') }}{% endif %}
+
+          [nodes]
+          {% for node in expected_remote_nodes %}
+          {% if node in unreachable_nodes %}  {{ node }}: UNREACHABLE (no result reported){% elif node in failed_remote_nodes %}  {{ node }}: FAILED - {{ hostvars[node].remote_check_summary.failed_names | join(', ') }}{% else %}  {{ node }}: OK{% endif %}
+
+          {% endfor %}
+          ------------------------------------------------------------
+          {% set total_bad = (global_fail_count | int) + (failed_remote_nodes | length) + (unreachable_nodes | length) %}
+          {% if total_bad == 0 %}RESULT: ALL VALIDATIONS PASSED - continuing{% else %}RESULT: VALIDATION FAILED - global_failed={{ global_fail_count }}, failed_nodes={{ failed_remote_nodes }}, unreachable={{ unreachable_nodes }}{% endif %}
+
+          ============================================================
+
+    - name: Show final summary
+      ansible.builtin.debug:
+        msg: "{{ final_summary.split('\n') }}"
+
+    - name: Fail the run if any validation failed (stops the next playbooks)
+      ansible.builtin.assert:
+        that:
+          - global_fail_count | int == 0
+          - failed_remote_nodes | length == 0
+          - unreachable_nodes | length == 0
+        fail_msg: >-
+          Validation failed - the next playbooks will not run.
+          global_failed={{ global_fail_count }},
+          failed_nodes={{ failed_remote_nodes }},
+          unreachable_nodes={{ unreachable_nodes }}
+        success_msg: "All validations passed"
+        quiet: true
