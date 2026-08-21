@@ -1,36 +1,14 @@
-# ------------------------------------------------------
-# 5. kube-controller-manager sağlıklı mı?
-# ------------------------------------------------------
-- name: Wait until kube-controller-manager is healthy
-  ansible.builtin.uri:
-    url: https://127.0.0.1:10257/healthz
-    validate_certs: false
-    return_content: true
-    status_code: 200
-  register: controller_manager_health
-  changed_when: false
-  failed_when: false
-  retries: 30
-  delay: 5
-  until:
-    - controller_manager_health.status == 200
-    - controller_manager_health.content | trim == "ok"
+    - name: Check if cluster directory already prepared
+      ansible.builtin.stat:
+        path: /tmp/{{ repo_name }}/cluster-core/clusters/{{ cluster_name }}
+      register: cluster_dir
 
-
-# ------------------------------------------------------
-# 6. kube-scheduler sağlıklı mı?
-# ------------------------------------------------------
-- name: Wait until kube-scheduler is healthy
-  ansible.builtin.uri:
-    url: https://127.0.0.1:10259/healthz
-    validate_certs: false
-    return_content: true
-    status_code: 200
-  register: scheduler_health
-  changed_when: false
-  failed_when: false
-  retries: 30
-  delay: 5
-  until:
-    - scheduler_health.status == 200
-    - scheduler_health.content | trim == "ok"
+    - name: Copy cluster manifests from TEMP template (only if not prepared)
+      ansible.builtin.copy:
+        src: /tmp/{{ repo_name }}/cluster-core/clusters/TEMP/
+        dest: /tmp/{{ repo_name }}/cluster-core/clusters/{{ cluster_name }}/
+        remote_src: true
+        owner: root
+        group: root
+        mode: preserve
+      when: not cluster_dir.stat.exists
