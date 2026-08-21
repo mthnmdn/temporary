@@ -1,126 +1,102 @@
-# =============================================================================
-#  KUBERNETES NODE EKLEME - ENVANTER (INVENTORY)
-# =============================================================================
+# ============================================================================
+# Node registration doğrulaması
+# ----------------------------------------------------------------------------
+# Amaç: label/taint (35) atılmadan önce, işlenecek tüm infra + worker
+# node'larının Kubernetes API'sine register olduğundan emin olmak.
 #
-#  Bu dosyayı düzenleyip playbook'u başlatıyorsunuz. Aşağıdaki kurallara
-#  uyarsanız doğrulama (validation) ve node ekleme playbook'ları sorunsuz
-#  çalışır.
+# CNI (cilium) henüz kurulmadığı için node'lar 'NotReady' durumdadır; bu yüzden
+# 'Ready' beklemiyoruz - yalnızca node'un API'de KAYITLI (mevcut) olmasını
+# bekliyoruz ('kubectl get node <ad>' rc==0).
 #
-#  ---------------------------------------------------------------------------
-#  NASIL DÜZENLENİR
-#  ---------------------------------------------------------------------------
-#  1) Node eklemek istediğiniz cluster'ın ilgili grubuna, eklenecek sunucunun
-#     adını yazın (her satıra bir sunucu).
-#
-#  2) YENİ BİR CLUSTER eklemek için:
-#       - Aşağıdaki "CLUSTER 2" şablonundaki '#' yorum işaretlerini kaldırın
-#         (grup başlıkları ve node satırları dâhil).
-#       - Node isimlerini kendi sunucularınızla değiştirin.
-#       - Dosyanın altındaki meta gruplarda (all_masters, all_infras,
-#         all_physical_workers, all_virtual_workers) ilgili cluster satırlarının
-#         da '#' işaretini kaldırın. BU ADIM ZORUNLUDUR; meta grupları
-#         güncellemezseniz yeni cluster playbook tarafından görülmez.
-#       - Daha fazla cluster (cluster3, cluster4, ...) için aynı şablonu
-#         kopyalayıp cluster numarasını artırın.
-#
-#  ---------------------------------------------------------------------------
-#  İSİMLENDİRME KURALLARI (doğrulama bunları denetler)
-#  ---------------------------------------------------------------------------
-#  * Grup isimleri 'clusterN_<rol>' biçiminde olmalıdır. Geçerli roller:
-#       _master  _physical_workers  _virtual_workers  _infra
-#    N yerine cluster numarası gelir (cluster1, cluster2, ...). Bu isimlendirme,
-#    playbook'un "hangi node hangi cluster'a ait" ilişkisini kurmasını sağlar.
-#
-#  * Her SUNUCU ADI 'lks' veya 'lk8s' ile başlamak zorundadır.
-#    Geçerli örnek:   lks-master01,  lk8s-worker-01
-#    Geçersiz örnek:  master01,  node1   (doğrulama bunları reddeder)
-#
-#  * Bir sunucu, aynı cluster içinde YALNIZCA BİR rol grubunda yer alabilir
-#    (örneğin hem physical hem virtual olamaz).
-#
-#  * Bir sunucu YALNIZCA BİR cluster'a ait olabilir; aynı sunucu adını başka
-#    bir cluster'ın gruplarına yazmayın.
-#
-#  * Her cluster'ın bir master'ı olmalı ve en az bir worker ya da infra node'u
-#    bulunmalıdır (yalnızca worker, yalnızca infra ya da her ikisi de olabilir).
-#
-#  ---------------------------------------------------------------------------
-#  DEĞİŞKENLER
-#  ---------------------------------------------------------------------------
-#  Dosyanın en altındaki [all:vars] bölümünde:
-#    * kubernetes_version : Kurulacak sürüm. Yalnızca izin verilen değerlerden
-#                           biri olabilir (örneğin "1.33" veya "1.35").
-#    * hide_logs          : true  -> hassas çıktılar gizlenir
-#                           false -> ayrıntılı çıktıyı ekranda görürsünüz
-# =============================================================================
+# master[0] üzerinde, kubeconfig_path ile çalışır (bu dosyayı import eden play
+# master[0]'ı hedeflemeli ve kubeconfig_path tanımlı olmalıdır).
+# ============================================================================
 
+- name: Wait until all infra and worker nodes are registered in the API
+  ansible.builtin.command: >-
+    kubectl get no {{ item }}
+    --kubeconfig {{ kubeconfig_path }}
+    -o name
+  loop: "{{ (groups['infra'] | default([]))
+            + (groups['physical_workers'] | default([]))
+            + (groups['virtual_workers'] | default([])) }}"
+  register: node_registered
+  changed_when: false
+  retries: 30
+  delay: 5
+  until: node_registered.rc == 0
+  loop_control:
+    label: "{{ item }}"
 
-# ----- CLUSTER 1 -------------------------------------------------------------
-# Bu cluster etkin. Node eklemek için ilgili grubun altına sunucu adı yazın.
+---
 
-[cluster1_master]
-lks-master01
+- name: Apply node labels and taints
+  hosts: master[0]
+  become: true
+  gather_facts: false
+  vars_files:
+    - "../vars/default-variables.yaml"
+  tasks:
 
-[cluster1_physical_workers]
-lks-physical-worker-01
+    - name: Label and taint infra and worker nodes
+      block:
+        # Label/taint atmadan önce tüm hedef node'lar API'ye register olsun.
+        # (NotFound kaynaklı hataların kök nedenini ortadan kaldırır.)
+        - name: Validate that all target nodes are registered
+          ansible.builtin.import_tasks:
+            file: "../validation-tasks/validate-nodes-registered.yaml"
 
-[cluster1_virtual_workers]
-lks-virtual-worker-01
+        - name: Label Infra Nodes
+          ansible.builtin.command: >-
+            kubectl label no {{ item }} {{ infra_labels }}
+            --kubeconfig {{ kubeconfig_path }} --overwrite
+          loop: "{{ groups['infra'] | default([]) }}"
+          register: label_infra
+          until: label_infra.rc == 0
+          retries: 5
+          delay: 5
+          changed_when: "'not labeled' not in label_infra.stdout"
 
-[cluster1_infra]
-lks-infra01
+        - name: Taint Infra Nodes
+          ansible.builtin.command: >-
+            kubectl taint no {{ item }} {{ infra_taints }}
+            --kubeconfig {{ kubeconfig_path }} --overwrite
+          loop: "{{ groups['infra'] | default([]) }}"
+          register: taint_infra
+          until: taint_infra.rc == 0
+          retries: 5
+          delay: 5
+          changed_when: "'not tainted' not in taint_infra.stdout"
 
+        - name: Label Physical Worker Nodes
+          ansible.builtin.command: >-
+            kubectl label no {{ item }} {{ physical_worker_labels }}
+            --kubeconfig {{ kubeconfig_path }} --overwrite
+          loop: "{{ groups['physical_workers'] | default([]) }}"
+          register: label_physical
+          until: label_physical.rc == 0
+          retries: 5
+          delay: 5
+          changed_when: "'not labeled' not in label_physical.stdout"
 
-# ----- CLUSTER 2 (ŞABLON - yeni cluster eklemek için '#' işaretlerini kaldırın) -----
-# Yeni bir cluster eklemek için aşağıdaki satırların başındaki '#' işaretlerini
-# silin, node isimlerini kendi sunucularınızla değiştirin ve dosyanın altındaki
-# meta gruplarda ilgili 'cluster2_*' satırlarının da '#' işaretini kaldırın.
+        - name: Label Virtual Worker Nodes
+          ansible.builtin.command: >-
+            kubectl label no {{ item }} {{ virtual_worker_labels }}
+            --kubeconfig {{ kubeconfig_path }} --overwrite
+          loop: "{{ groups['virtual_workers'] | default([]) }}"
+          register: label_virtual
+          until: label_virtual.rc == 0
+          retries: 5
+          delay: 5
+          changed_when: "'not labeled' not in label_virtual.stdout"
 
-#[cluster2_master]
-#lks-master02
-#
-#[cluster2_physical_workers]
-#lks-physical-worker-02
-#
-#[cluster2_virtual_workers]
-#lks-virtual-worker-02
-#
-#[cluster2_infra]
-#lks-infra02
-
-# -----------------------------------------------------------------------------
-
-
-# =============================================================================
-#  META GRUPLAR - alt grupları otomatik toplayan gruplardır.
-#
-#  Yeni bir cluster eklerken, o cluster'ın DÖRT satırını da (aşağıdaki dört meta
-#  grubun her birinde) yorumdan çıkarmayı unutmayın. Playbook, node'ları bu meta
-#  gruplar üzerinden hedefler; buraya eklenmeyen bir cluster görülmez.
-# =============================================================================
-
-[all_masters:children]
-cluster1_master
-#cluster2_master
-
-[all_infras:children]
-cluster1_infra
-#cluster2_infra
-
-[all_physical_workers:children]
-cluster1_physical_workers
-#cluster2_physical_workers
-
-[all_virtual_workers:children]
-cluster1_virtual_workers
-#cluster2_virtual_workers
-
-
-# =============================================================================
-#  TÜM HOST'LARA UYGULANAN DEĞİŞKENLER
-# =============================================================================
-
-[all:vars]
-
-kubernetes_version="1.35"
-hide_logs=false
+        # kube-system ns label!!!!
+        - name: Label kube-system Namespace
+          ansible.builtin.command: >-
+            kubectl label ns kube-system monitoring=kube-prometheus-stack
+            --kubeconfig {{ kubeconfig_path }} --overwrite
+          register: label_ns
+          until: label_ns.rc == 0
+          retries: 5
+          delay: 5
+          changed_when: "'not labeled' not in label_ns.stdout"
