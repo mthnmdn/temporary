@@ -1,14 +1,14 @@
-    - name: Check if cluster directory already prepared
-      ansible.builtin.stat:
-        path: /tmp/{{ repo_name }}/cluster-core/clusters/{{ cluster_name }}
-      register: cluster_dir
+    - name: Check for staged changes
+      ansible.builtin.command: git status --porcelain
+      args:
+        chdir: /tmp/{{ repo_name }}/
+      register: git_status
+      changed_when: false
 
-    - name: Copy cluster manifests from TEMP template (only if not prepared)
-      ansible.builtin.copy:
-        src: /tmp/{{ repo_name }}/cluster-core/clusters/TEMP/
-        dest: /tmp/{{ repo_name }}/cluster-core/clusters/{{ cluster_name }}/
-        remote_src: true
-        owner: root
-        group: root
-        mode: preserve
-      when: not cluster_dir.stat.exists
+    - name: Commit changes (only when there is something to commit)
+      ansible.builtin.command: git commit -m "Provision cluster {{ cluster_name }}"
+      args:
+        chdir: /tmp/{{ repo_name }}/
+      when: git_status.stdout | trim | length > 0
+      register: git_commit
+      changed_when: git_commit.rc == 0
