@@ -1,61 +1,62 @@
 # =============================================================================
-#  KUBERNETES NODE EKLEME - INVENTORY
+#  KUBERNETES NODE EKLEME - ENVANTER (INVENTORY)
 # =============================================================================
 #
-#  Bu dosyayi duzenleyip playbook'u baslatiyorsunuz. Asagidaki kurallara
-#  uyarsaniz validation ve node-ekleme playbook'lari sorunsuz calisir.
+#  Bu dosyayı düzenleyip playbook'u başlatıyorsunuz. Aşağıdaki kurallara
+#  uyarsanız doğrulama (validation) ve node ekleme playbook'ları sorunsuz
+#  çalışır.
 #
 #  ---------------------------------------------------------------------------
-#  NASIL DUZENLENIR
+#  NASIL DÜZENLENİR
 #  ---------------------------------------------------------------------------
-#  1) Node eklemek istediginiz cluster'in ilgili grubuna, eklenecek
-#     sunucunun adini yazin (her satira bir sunucu).
+#  1) Node eklemek istediğiniz cluster'ın ilgili grubuna, eklenecek sunucunun
+#     adını yazın (her satıra bir sunucu).
 #
-#  2) YENI BIR CLUSTER eklemek icin:
-#       - Asagidaki "CLUSTER 2" sablonundaki '#' yorum isaretlerini kaldirin
-#         (grup basliklari ve node satirlari dahil).
-#       - Node isimlerini kendi sunucularinizla degistirin.
-#       - Dosyanin altindaki meta-gruplarda (all_masters, all_infras,
-#         all_physical_workers, all_virtual_workers) ilgili cluster satirlarinin
-#         da '#' isaretini kaldirin. BU ADIM ZORUNLU - meta-gruplari
-#         guncellemezseniz yeni cluster playbook tarafindan gorulmez.
-#       - Daha fazla cluster (cluster3, cluster4, ...) icin ayni sablonu
-#         kopyalayip cluster numarasini artirin.
+#  2) YENİ BİR CLUSTER eklemek için:
+#       - Aşağıdaki "CLUSTER 2" şablonundaki '#' yorum işaretlerini kaldırın
+#         (grup başlıkları ve node satırları dâhil).
+#       - Node isimlerini kendi sunucularınızla değiştirin.
+#       - Dosyanın altındaki meta gruplarda (all_masters, all_infras,
+#         all_physical_workers, all_virtual_workers) ilgili cluster satırlarının
+#         da '#' işaretini kaldırın. BU ADIM ZORUNLUDUR; meta grupları
+#         güncellemezseniz yeni cluster playbook tarafından görülmez.
+#       - Daha fazla cluster (cluster3, cluster4, ...) için aynı şablonu
+#         kopyalayıp cluster numarasını artırın.
 #
 #  ---------------------------------------------------------------------------
-#  ISIMLENDIRME KURALLARI (validation bunlari kontrol eder)
+#  İSİMLENDİRME KURALLARI (doğrulama bunları denetler)
 #  ---------------------------------------------------------------------------
-#  * Grup isimleri 'clusterN_<rol>' biciminde olmali. Gecerli roller:
+#  * Grup isimleri 'clusterN_<rol>' biçiminde olmalıdır. Geçerli roller:
 #       _master  _physical_workers  _virtual_workers  _infra
-#    N yerine cluster numarasi gelir (cluster1, cluster2, ...). Bu isimlendirme
-#    playbook'un "hangi node hangi cluster'a ait" iliskisini kurmasini saglar.
+#    N yerine cluster numarası gelir (cluster1, cluster2, ...). Bu isimlendirme,
+#    playbook'un "hangi node hangi cluster'a ait" ilişkisini kurmasını sağlar.
 #
-#  * Her SUNUCU ADI 'lks' veya 'lk8s' ile baslamak zorundadir.
-#    Ornek gecerli:   lks-master01,  lk8s-worker-01
-#    Ornek gecersiz:  master01,  node1   (validation bunlari reddeder)
+#  * Her SUNUCU ADI 'lks' veya 'lk8s' ile başlamak zorundadır.
+#    Geçerli örnek:   lks-master01,  lk8s-worker-01
+#    Geçersiz örnek:  master01,  node1   (doğrulama bunları reddeder)
 #
-#  * Bir sunucu ayni cluster icinde YALNIZCA BIR role grubunda olabilir
-#    (ornegin hem physical hem virtual olamaz).
+#  * Bir sunucu, aynı cluster içinde YALNIZCA BİR rol grubunda yer alabilir
+#    (örneğin hem physical hem virtual olamaz).
 #
-#  * Bir sunucu YALNIZCA BIR cluster'a ait olabilir; ayni sunucu adini
-#    baska bir cluster'in gruplarina yazmayin.
+#  * Bir sunucu YALNIZCA BİR cluster'a ait olabilir; aynı sunucu adını başka
+#    bir cluster'ın gruplarına yazmayın.
 #
-#  * Her cluster'in bir master'i olmali ve en az bir worker VEYA infra
-#    node'u bulunmali (yalnizca worker, yalnizca infra veya ikisi de olabilir).
+#  * Her cluster'ın bir master'ı olmalı ve en az bir worker ya da infra node'u
+#    bulunmalıdır (yalnızca worker, yalnızca infra ya da her ikisi de olabilir).
 #
 #  ---------------------------------------------------------------------------
-#  DEGISKENLER
+#  DEĞİŞKENLER
 #  ---------------------------------------------------------------------------
-#  Dosyanin en altindaki [all:vars] bolumunde:
-#    * kubernetes_version : Kurulacak surum. Yalnizca izin verilen
-#                           degerlerden biri olabilir (or. "1.33" veya "1.35").
-#    * hide_logs          : true  -> hassas ciktilar gizlenir
-#                           false -> ayrintili ciktiyi ekranda gorursunuz
+#  Dosyanın en altındaki [all:vars] bölümünde:
+#    * kubernetes_version : Kurulacak sürüm. Yalnızca izin verilen değerlerden
+#                           biri olabilir (örneğin "1.33" veya "1.35").
+#    * hide_logs          : true  -> hassas çıktılar gizlenir
+#                           false -> ayrıntılı çıktıyı ekranda görürsünüz
 # =============================================================================
 
 
 # ----- CLUSTER 1 -------------------------------------------------------------
-# Bu cluster aktif. Node eklemek icin ilgili grubun altina sunucu adi yazin.
+# Bu cluster etkin. Node eklemek için ilgili grubun altına sunucu adı yazın.
 
 [cluster1_master]
 lks-master01
@@ -70,10 +71,10 @@ lks-virtual-worker-01
 lks-infra01
 
 
-# ----- CLUSTER 2 (SABLON - yeni cluster eklemek icin '#' isaretlerini kaldirin) -----
-# Yeni bir cluster eklemek icin asagidaki satirlarin basindaki '#' isaretlerini
-# silin, node isimlerini kendi sunucularinizla degistirin ve dosyanin altindaki
-# meta-gruplarda ilgili 'cluster2_*' satirlarinin da '#' isaretini kaldirin.
+# ----- CLUSTER 2 (ŞABLON - yeni cluster eklemek için '#' işaretlerini kaldırın) -----
+# Yeni bir cluster eklemek için aşağıdaki satırların başındaki '#' işaretlerini
+# silin, node isimlerini kendi sunucularınızla değiştirin ve dosyanın altındaki
+# meta gruplarda ilgili 'cluster2_*' satırlarının da '#' işaretini kaldırın.
 
 #[cluster2_master]
 #lks-master02
@@ -91,11 +92,11 @@ lks-infra01
 
 
 # =============================================================================
-#  META-GRUPLAR - alt gruplari otomatik toplayan gruplar.
+#  META GRUPLAR - alt grupları otomatik toplayan gruplardır.
 #
-#  Yeni bir cluster eklerken, o cluster'in DORT satirini da (asagidaki dort
-#  meta-grubun her birinde) yorumdan cikarmayi unutmayin. Playbook node'lari
-#  bu meta-gruplar uzerinden hedefler; buraya eklenmeyen bir cluster gorulmez.
+#  Yeni bir cluster eklerken, o cluster'ın DÖRT satırını da (aşağıdaki dört meta
+#  grubun her birinde) yorumdan çıkarmayı unutmayın. Playbook, node'ları bu meta
+#  gruplar üzerinden hedefler; buraya eklenmeyen bir cluster görülmez.
 # =============================================================================
 
 [all_masters:children]
@@ -116,7 +117,7 @@ cluster1_virtual_workers
 
 
 # =============================================================================
-#  TUM HOST'LARA UYGULANAN DEGISKENLER
+#  TÜM HOST'LARA UYGULANAN DEĞİŞKENLER
 # =============================================================================
 
 [all:vars]
