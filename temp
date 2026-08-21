@@ -1,14 +1,11 @@
-    - name: Check for staged changes
-      ansible.builtin.command: git status --porcelain
+    - name: Configure git identity (repo-local)
+      ansible.builtin.command: git config --local {{ item.key }} "{{ item.value }}"
       args:
         chdir: /tmp/{{ repo_name }}/
-      register: git_status
+      loop:
+        - { key: "user.email", value: "{{ username }}@akbank.com" }
+        - { key: "user.name", value: "{{ username }}" }
+        - { key: "core.sshCommand", value: "ssh -i ~/.ssh/tfs_k8s_id_rsa" }
+      loop_control:
+        label: "{{ item.key }}"
       changed_when: false
-
-    - name: Commit changes (only when there is something to commit)
-      ansible.builtin.command: git commit -m "Provision cluster {{ cluster_name }}"
-      args:
-        chdir: /tmp/{{ repo_name }}/
-      when: git_status.stdout | trim | length > 0
-      register: git_commit
-      changed_when: git_commit.rc == 0
